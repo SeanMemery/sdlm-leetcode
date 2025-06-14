@@ -106,7 +106,7 @@ class STGS(nn.Module):
         output_one_hot = output_one_hot.half() if x.dtype == torch.half else output_one_hot.float()
 
         # Differentiable output ids:
-        gathered_one_hot = torch.gather(output_one_hot, dim=-1, index=output_ids.unsqueeze(-1))
+        gathered_one_hot = torch.gather(output_one_hot, dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
         diff_output_ids = output_ids.detach()-gathered_one_hot.detach()+gathered_one_hot
         # batch_size x seq_len
         

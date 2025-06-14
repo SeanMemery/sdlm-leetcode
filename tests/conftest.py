@@ -9,7 +9,7 @@ def device():
 @pytest.fixture(scope="session")
 def test_model_and_tokenizer(device):
     # Use a small model for testing
-    model_name = "gpt2"
+    model_name = "distilbert/distilgpt2"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -19,3 +19,8 @@ def test_model_and_tokenizer(device):
 @pytest.fixture(scope="session")
 def test_string():
     return "This is a test string for STGSDiffString"
+
+@pytest.fixture(scope="session")
+def vocab_size():
+    return 50257
+    

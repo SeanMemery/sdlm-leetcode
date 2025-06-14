@@ -61,31 +61,49 @@ Run the test suite with:
 pytest tests/
 ```
 
-### TODO List
+### Test Status
 
-#### STGS Class Tests
-- [ ] Test initialization with different parameters
-- [ ] Test forward pass with fixed temperature
-- [ ] Test forward pass with learnable temperature
-- [ ] Test gradient flow through STGS operation
-- [ ] Test hard vs soft sampling modes
-- [ ] Test device handling (CPU/GPU)
+#### ✅ Completed Tests
 
-#### STGSDiffModel Tests
-- [ ] Test initialization with different model types
-- [ ] Test forward pass with and without labels
-- [ ] Test gradient flow through generation
-- [ ] Test temperature scheduling
-- [ ] Test batch processing
-- [ ] Test attention mask handling
-- [ ] Test with different model architectures
+##### STGS Class Tests
+- [x] Test initialization with different parameters
+- [x] Test forward pass with fixed temperature
+- [x] Test forward pass with learnable temperature
+- [x] Test gradient flow through STGS operation
+- [x] Test hard vs soft sampling modes
+- [x] Test device handling (CPU/GPU)
 
-#### STGSDiffString Tests
-- [ ] Test initialization with different strings
-- [ ] Test string manipulation operations
-- [ ] Test gradient flow through string operations
-- [ ] Test device handling
-- [ ] Test serialization/deserialization
+##### STGSDiffModel Tests
+- [x] Test initialization with different model types
+- [x] Test forward pass with and without labels
+- [x] Test gradient flow through generation
+- [x] Test batch processing
+- [x] Test attention mask handling
+- [x] Test with different model architectures
+
+##### STGSDiffString Tests
+- [x] Test initialization with different strings
+- [x] Test string manipulation operations
+- [x] Test gradient flow through string operations
+- [x] Test device handling
+- [x] Test serialization/deserialization
+
+#### 🚧 Upcoming Tests
+
+##### Enhanced Test Coverage
+- [ ] Add comprehensive batch processing tests with varying batch sizes
+- [ ] Add edge case tests for empty strings and max sequence lengths
+- [ ] Add integration tests for the full text generation pipeline
+- [ ] Add performance benchmarks for different model sizes
+- [ ] Test compatibility with different tokenizers and model architectures
+- [ ] Add tests for mixed-precision training scenarios
+- [ ] Test gradient checkpointing for memory efficiency
+
+##### Documentation & Examples
+- [ ] Add detailed API documentation
+- [ ] Create interactive notebooks for key use cases
+- [ ] Add example scripts for common NLP tasks
+- [ ] Document best practices for training and inference
 
 ## License
 
