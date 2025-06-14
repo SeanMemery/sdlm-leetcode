@@ -9,7 +9,8 @@ class STGSDiffString(nn.Module):
     """
     A class that represents a differentiable string using the STGS (Straight-Through Gumbel-Softmax)
     operation. It maintains both a one-hot encoded tensor representation of tokens and the 
-    corresponding string.
+    corresponding string. It does not include special tokens (e.g. BOS, EOS, etc.) in the 
+    input_ids and logits.
     """
     
     def __init__(self, 
@@ -39,7 +40,7 @@ class STGSDiffString(nn.Module):
             tokenizer.encode(
                 initial_string, 
                 return_tensors='pt',
-                skip_special_tokens=True,
+                add_special_tokens=False,
             ).to(device),
             device=device
         )

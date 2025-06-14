@@ -1,5 +1,6 @@
 import torch
 import pytest
+import torch.nn.functional as F
 from sdlm import STGSDiffString
 
 class TestSTGSDiffString:
@@ -18,6 +19,8 @@ class TestSTGSDiffString:
         
         # Test string representation
         assert isinstance(str(diff_string), str)
+        assert isinstance(diff_string.get_string(), str)
+        assert isinstance(diff_string.get_input_ids(), torch.Tensor)
         assert len(diff_string) > 0
     
     def test_forward_pass(self, test_model_and_tokenizer, test_string, device):
@@ -80,7 +83,7 @@ class TestSTGSDiffString:
             torch.ones_like(torch.sum(soft_one_hot, dim=-1))
         )
     
-    def test_gradient_flow(self, test_model_and_tokenizer, test_string, device):
+    def test_one_hot_gradient_flow(self, test_model_and_tokenizer, test_string, target_test_string, device):
         _, tokenizer = test_model_and_tokenizer
         diff_string = STGSDiffString(
             initial_string=test_string,
@@ -88,11 +91,58 @@ class TestSTGSDiffString:
             device=device
         )
         
-        # Forward pass
-        input_ids, one_hot, _ = diff_string()
+        tokenized_target_test_string = tokenizer.encode(
+            target_test_string, 
+            return_tensors='pt',
+            add_special_tokens=False,
+        ).to(device)
+        # batch_size x seq_len
+
+        target_one_hot = F.one_hot(
+            tokenized_target_test_string, 
+            num_classes=tokenizer.vocab_size,
+        ).float().to(device)
+        # batch_size x seq_len x vocab_size
         
+        # Forward pass
+        diff_input_ids, diff_one_hot, _ = diff_string()
+        # batch_size x seq_len
+        # batch_size x seq_len x vocab_size
+
         # Compute loss and backpropagate
-        loss = one_hot.sum()
+        min_len = min(diff_one_hot.shape[1], target_one_hot.shape[1])
+        # ... until min_len: 
+        loss = (diff_one_hot[:, :min_len] - target_one_hot[:, :min_len]).sum()
+        loss.backward()
+        
+        # Check that gradients are flowing back to logits
+        assert diff_string.logits.grad is not None
+        assert not torch.all(diff_string.logits.grad == 0)
+    
+    def test_ids_gradient_flow(self, test_model_and_tokenizer, test_string, target_test_string, device):
+        _, tokenizer = test_model_and_tokenizer
+        diff_string = STGSDiffString(
+            initial_string=test_string,
+            tokenizer=tokenizer,
+            device=device
+        )
+        
+        target_input_ids = tokenizer.encode(
+            target_test_string, 
+            return_tensors='pt',
+            add_special_tokens=False,
+        ).to(device)
+        # batch_size x seq_len
+        
+        # Forward pass
+        diff_input_ids, diff_one_hot, _ = diff_string()
+        # batch_size x seq_len
+        # batch_size x seq_len x vocab_size
+
+        # Compute loss and backpropagate
+        min_len = min(diff_input_ids.shape[1], target_input_ids.shape[1])
+        # ... until min_len: 
+        loss = (diff_input_ids[:, :min_len] - target_input_ids[:, :min_len]).sum()
         loss.backward()
         
         # Check that gradients are flowing back to logits
