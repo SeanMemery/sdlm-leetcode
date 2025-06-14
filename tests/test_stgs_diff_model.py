@@ -1,5 +1,6 @@
 import torch
 import pytest
+from transformers import AutoModelForCausalLM
 from sdlm import STGSDiffModel
 
 class TestSTGSDiffModel:
@@ -19,8 +20,8 @@ class TestSTGSDiffModel:
         assert diff_model.device == device
         
         # Check default parameters
-        assert diff_model.temperature == 1.0
-        assert diff_model.hard is True
+        assert diff_model.stgs.init_temperature == 1.0
+        assert diff_model.stgs.stgs_hard is False
     
     def test_forward_pass(self, test_model_and_tokenizer, device):
         model, tokenizer = test_model_and_tokenizer
@@ -40,17 +41,16 @@ class TestSTGSDiffModel:
         # Check output keys
         expected_keys = {
             'logits', 'hidden_states', 'past_key_values',
-            'sampled_tokens', 'sampled_diff_tokens', 'sampled_one_hot',
-            'temperature', 'sampled_probs'
+            'sampled_diff_tokens', 'sampled_diff_one_hot',
+            'temperature', 'stgs_logits'
         }
         assert all(key in outputs for key in expected_keys)
         
         # Check shapes
         batch_size, seq_len = inputs['input_ids'].shape
         assert outputs['logits'].shape == (batch_size, seq_len, tokenizer.vocab_size)
-        assert outputs['sampled_tokens'].shape == (batch_size, seq_len)
         assert outputs['sampled_diff_tokens'].shape == (batch_size, seq_len)
-        assert outputs['sampled_one_hot'].shape == (batch_size, seq_len, tokenizer.vocab_size)
+        assert outputs['sampled_diff_one_hot'].shape == (batch_size, seq_len, tokenizer.vocab_size)
     
     def test_generate_standard(self, test_model_and_tokenizer, device):
         model, tokenizer = test_model_and_tokenizer
@@ -125,7 +125,7 @@ class TestSTGSDiffModel:
         outputs = diff_model(**inputs)
         
         # Compute loss and backpropagate
-        loss = outputs['sampled_one_hot'].sum()
+        loss = outputs['sampled_diff_one_hot'].sum()
         loss.backward()
         
         # Check that gradients are flowing

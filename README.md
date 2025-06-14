@@ -99,6 +99,12 @@ pytest tests/
 - [ ] Add tests for mixed-precision training scenarios
 - [ ] Test gradient checkpointing for memory efficiency
 
+##### STGSDiffString Tests
+- [ ] Test string update strategy based on gradient flow
+- [ ] Test strategy to increase string length
+- [ ] Test strategy to decrease string length
+- [ ] Test gradient flow through STGSDiffModel 
+
 ##### Documentation & Examples
 - [ ] Add detailed API documentation
 - [ ] Create interactive notebooks for key use cases

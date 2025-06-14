@@ -85,6 +85,19 @@ class STGSDiffString(nn.Module):
         decoded_string = self.tokenizer.decode(input_ids.long()[0].tolist())
 
         return input_ids, one_hot, decoded_string
+
+    def update(self):
+        """Update the current logits based on a previously computed gradient."""
+        if self.logits.grad is None:
+            raise ValueError("Gradient not computed. Call .backward() on a loss before updating.")
+        
+        raise NotImplementedError
+        #TODO: consider using a learning rate and optimizer
+        #TODO: consider adding fluency constraints-derived gradient contributions
+        #TODO: consider increasing/decreasing the length of the string based on fluency
+
+        self.logits.data.add_(self.logits.grad.data)
+        self.logits.grad.zero_()    
     
     def get_string(self) -> str:
         """Get the current string representation."""

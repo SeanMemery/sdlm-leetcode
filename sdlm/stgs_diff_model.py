@@ -38,7 +38,7 @@ class STGSDiffModel(PreTrainedModel):
         self.tokenizer = tokenizer
         self.vocab_size = len(tokenizer)
         self.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-        self.device = device or next(model.parameters()).device
+        assert self.device == device or device is None 
         
         # Initialize STGS module
         self.stgs = STGS(
@@ -60,6 +60,8 @@ class STGSDiffModel(PreTrainedModel):
         labels: Optional[Tensor] = None,
         inputs_embeds: Optional[Tensor] = None,
         output_hidden_states: bool = True,
+        output_past_key_values: bool = True,
+        return_dict: bool = True,
         **kwargs
     ) -> Dict[str, Tensor]:
         """
@@ -71,6 +73,7 @@ class STGSDiffModel(PreTrainedModel):
             labels: Target token IDs for loss computation
             inputs_embeds: Optional precomputed embeddings
             output_hidden_states: Whether to output hidden states
+            return_dict: Whether to return a dictionary of outputs
             **kwargs: Additional arguments for the model
             
         Returns:
@@ -89,6 +92,7 @@ class STGSDiffModel(PreTrainedModel):
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
+            output_past_key_values=output_past_key_values,
             return_dict=True,
             **kwargs
         )
@@ -119,13 +123,18 @@ class STGSDiffModel(PreTrainedModel):
             'sampled_diff_tokens': diff_output_ids,
             'sampled_diff_one_hot': diff_one_hot,
             'temperature': temperature,
-            'loss': loss,
+            'loss': loss, 
         }
         
         if output_hidden_states and hidden_states is not None:
             output_dict['hidden_states'] = hidden_states
-            
-        return output_dict
+        if output_past_key_values and outputs.past_key_values is not None:
+            output_dict['past_key_values'] = outputs.past_key_values    
+
+        if return_dict:
+            return output_dict
+        else:
+            return logits
     
     def generate(
         self,
@@ -165,112 +174,124 @@ class STGSDiffModel(PreTrainedModel):
         if temperature is not None:
             self.stgs.init_temperature = temperature
         
-        try:
-            # Prepare inputs
-            if input_ids is None:
-                input_ids = torch.tensor([[self.tokenizer.bos_token_id or self.tokenizer.eos_token_id]], 
-                                       device=self.device)
+        # Prepare inputs
+        if input_ids is None:
+            input_ids = torch.tensor([[self.tokenizer.bos_token_id or self.tokenizer.eos_token_id]], 
+                                   device=self.device)
+        
+        batch_size = input_ids.size(0)
+        
+        if attention_mask is None and input_ids is not None:
+            attention_mask = (input_ids != self.pad_token_id).long()
+        
+        # Get embedding layer
+        embedding_layer = self.model.get_input_embeddings()
+        
+        # If using BPTToken, we need to handle the generation differently
+        if use_bpttoken:
+            # Prepare for BPTToken generation
+            past_key_values = None
+            all_logits = []
             
-            batch_size = input_ids.size(0)
+            # Initial forward pass
+            outputs = self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                output_past_key_values=True,
+                use_cache=True,
+                return_dict=True,
+                **kwargs
+            )
             
-            if attention_mask is None and input_ids is not None:
-                attention_mask = (input_ids != self.pad_token_id).long()
+            # Get logits and filter if needed
+            logits = outputs['logits']
+            all_logits.append(logits[:, -1:, :])
             
-            # Get embedding layer
-            embedding_layer = self.model.get_input_embeddings()
-            
-            # If using BPTToken, we need to handle the generation differently
-            if use_bpttoken:
-                # Prepare for BPTToken generation
-                past_key_values = None
-                all_logits = []
-                
-                # Initial forward pass
-                outputs = self(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
+            # Get next token using STGS
+            next_token_diff, next_token_one_hot = \
+                outputs['sampled_diff_tokens'][:,-1:], outputs['sampled_diff_one_hot'][:,-1:]
+            # batch_size x 1
+            # batch_size x 1 x vocab_size
+
+            # Get embeddings for the next token
+            next_token_embedding = torch.matmul(next_token_one_hot, embedding_layer.weight.unsqueeze(0))
+            # batch_size x 1 x embedding_dim
+
+            # Update input sequence
+            input_ids = torch.cat([input_ids, next_token_diff.long()], dim=-1)
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
+            ], dim=-1)
+            # batch_size x seq_len+1
+
+            # Generation loop with BPTT
+            for it in range(1, max_length - input_ids.size(1) + 1):
+                # Forward pass with past key values for efficient generation
+                outputs = self.forward(
+                    inputs_embeds=next_token_embedding,
+                    #attention_mask=attention_mask,
+                    past_key_values=outputs['past_key_values'],
                     output_hidden_states=True,
                     use_cache=True,
                     return_dict=True,
                     **kwargs
                 )
                 
-                # Get logits and filter if needed
-                logits = outputs.logits
-                all_logits.append(logits[:, -1:, :])
-                
-                # Get next token using STGS
-                next_token_diff, next_token_one_hot, _, _ = self.stgs(logits[:, -1:, :])
+                # Get logits for ONLY THE NEXT TOKEN:
+                logits = outputs['logits']
+                all_logits.append(logits)
+                # batch_size x 1 x vocab_size
+                # batch_size x [seq_len+1] x vocab_size
+
+                # Get next token differentiable elements:
+                next_token_diff, next_token_one_hot = \
+                    outputs['sampled_diff_tokens'], outputs['sampled_diff_one_hot']
+                # batch_size x 1
+                # batch_size x 1 x vocab_size
                 
                 # Get embeddings for the next token
                 next_token_embedding = torch.matmul(next_token_one_hot, embedding_layer.weight.unsqueeze(0))
+                # batch_size x 1 x embedding_dim
                 
                 # Update input sequence
                 input_ids = torch.cat([input_ids, next_token_diff.long()], dim=-1)
+                # batch_size x seq_len+it+1
                 attention_mask = torch.cat([
                     attention_mask,
                     torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
                 ], dim=-1)
+                # batch_size x seq_len+it+1
+        else:
+            # Standard generation without BPTT
+            for it in range(max_length - input_ids.size(1)):
+                # Get model outputs
+                outputs = self.forward(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    **kwargs
+                )
                 
-                # Generation loop with BPTT
-                for _ in range(1, max_length - input_ids.size(1) + 1):
-                    # Forward pass with past key values for efficient generation
-                    outputs = self(
-                        inputs_embeds=next_token_embedding,
-                        attention_mask=attention_mask,
-                        past_key_values=outputs.past_key_values,
-                        output_hidden_states=True,
-                        use_cache=True,
-                        return_dict=True,
-                        **kwargs
-                    )
-                    
-                    # Get logits
-                    logits = outputs.logits
-                    all_logits.append(logits)
-                    
-                    # Get next token using STGS
-                    next_token_diff, next_token_one_hot, _, _ = self.stgs(logits)
-                    
-                    # Get embeddings for the next token
-                    next_token_embedding = torch.matmul(next_token_one_hot, embedding_layer.weight.unsqueeze(0))
-                    
-                    # Update input sequence
-                    input_ids = torch.cat([input_ids, next_token_diff.long()], dim=-1)
-                    attention_mask = torch.cat([
-                        attention_mask,
-                        torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
-                    ], dim=-1)
+                # Get next token (greedy sampling from STGS distribution)
+                next_token = outputs['sampled_diff_tokens'][:, -1:]
+                # batch_size x 1
                 
-                return input_ids
-                
-            else:
-                # Standard generation without BPTT
-                for _ in range(max_length - input_ids.size(1)):
-                    # Get model outputs
-                    outputs = self(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_hidden_states=True,
-                        **kwargs
-                    )
-                    
-                    # Get next token (greedy sampling from STGS distribution)
-                    next_token = outputs['sampled_diff_tokens'][:, -1:]
-                    
-                    # Update input_ids and attention_mask
-                    input_ids = torch.cat([input_ids, next_token.long()], dim=-1)
-                    attention_mask = torch.cat([
-                        attention_mask, 
-                        torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
-                    ], dim=-1)
-                
-                return input_ids
-                
-        finally:
-            # Restore original mode and temperature
-            self.train(original_mode)
-            self.stgs.init_temperature = original_temp
+                # Update input_ids and attention_mask
+                input_ids = torch.cat([input_ids, next_token.long()], dim=-1)
+                # batch_size x seq_len+it+1
+                attention_mask = torch.cat([
+                    attention_mask, 
+                    torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
+                ], dim=-1)
+                # batch_size x seq_len+it+1
+            
+        # Restore original mode and temperature
+        self.train(original_mode)
+        self.stgs.init_temperature = original_temp
+        
+        return input_ids
     
     def to(self, device=None, *args, **kwargs):
         """Moves the model to the specified device."""
