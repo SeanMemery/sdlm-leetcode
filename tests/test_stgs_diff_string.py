@@ -83,12 +83,30 @@ class TestSTGSDiffString:
             torch.ones_like(torch.sum(soft_one_hot, dim=-1))
         )
     
-    def test_one_hot_gradient_flow(self, test_model_and_tokenizer, test_string, target_test_string, device):
+    @pytest.mark.parametrize("stgs_hard", [True, False])
+    @pytest.mark.parametrize("learnable_temperature", [True, False])
+    @pytest.mark.parametrize("temperature", [0.1, 1.0, 2.0])
+    @pytest.mark.parametrize("logit_scaler", [0.1, 1.0, 5.0])
+    def test_one_hot_gradient_flow(
+        self, 
+        test_model_and_tokenizer, 
+        test_string, 
+        target_test_string, 
+        device, 
+        stgs_hard, 
+        learnable_temperature,
+        temperature,
+        logit_scaler,
+    ):
         _, tokenizer = test_model_and_tokenizer
         diff_string = STGSDiffString(
             initial_string=test_string,
             tokenizer=tokenizer,
-            device=device
+            hard=stgs_hard,
+            learnable_temperature=learnable_temperature,
+            temperature=temperature,
+            device=device,
+            logit_scaler=logit_scaler,
         )
         
         tokenized_target_test_string = tokenizer.encode(
@@ -119,12 +137,30 @@ class TestSTGSDiffString:
         assert diff_string.logits.grad is not None
         assert not torch.all(diff_string.logits.grad == 0)
     
-    def test_ids_gradient_flow(self, test_model_and_tokenizer, test_string, target_test_string, device):
+    @pytest.mark.parametrize("stgs_hard", [True, False])
+    @pytest.mark.parametrize("learnable_temperature", [True, False])
+    @pytest.mark.parametrize("temperature", [0.1, 1.0, 2.0])
+    @pytest.mark.parametrize("logit_scaler", [0.1, 1.0, 5.0])
+    def test_ids_gradient_flow(
+        self, 
+        test_model_and_tokenizer, 
+        test_string, 
+        target_test_string, 
+        device, 
+        stgs_hard, 
+        learnable_temperature,
+        temperature,
+        logit_scaler,
+    ):
         _, tokenizer = test_model_and_tokenizer
         diff_string = STGSDiffString(
             initial_string=test_string,
             tokenizer=tokenizer,
-            device=device
+            hard=stgs_hard,
+            learnable_temperature=learnable_temperature,
+            temperature=temperature,
+            logit_scaler=logit_scaler,
+            device=device,
         )
         
         target_input_ids = tokenizer.encode(

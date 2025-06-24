@@ -64,7 +64,7 @@ class STGS(nn.Module):
         """
         if self.learnable_temperature:
             if self.conditioning_dim < 1:
-                eff_temperature = self.eps + 1. / (F.softplus(self.temperature_param) + 1.0/(self.eps+self.init_temperature))
+                eff_temperature = F.softplus(self.temperature_param) + self.init_temperature
             else:
                 assert hidden_states is not None
                 batch_size = x.shape[0]
@@ -101,7 +101,7 @@ class STGS(nn.Module):
         else:
             output_one_hot = y_soft
             # batch_size x seq_len x vocab_size
-        
+
         # Type: half or full
         output_one_hot = output_one_hot.half() if x.dtype == torch.half else output_one_hot.float()
 

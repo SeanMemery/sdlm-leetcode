@@ -22,7 +22,7 @@ def test_string():
 
 @pytest.fixture(scope="session")
 def target_test_string():
-    return "This is a target test string for STGSDiffString"
+    return "This string is a target test string for STGSDiffString"
 
 @pytest.fixture(scope="session")
 def vocab_size():

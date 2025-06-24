@@ -5,6 +5,7 @@ from typing import Tuple
 
 from .stgs import STGS
 
+
 class STGSDiffString(nn.Module):
     """
     A class that represents a differentiable string using the STGS (Straight-Through Gumbel-Softmax)
@@ -16,6 +17,7 @@ class STGSDiffString(nn.Module):
     def __init__(self, 
                  initial_string: str,
                  tokenizer,
+                 logit_scaler: float = 1.0,
                  temperature: float = 1.0,
                  hard: bool = False,
                  learnable_temperature: bool = False,
@@ -36,24 +38,22 @@ class STGSDiffString(nn.Module):
         self.device = device
         
         # Encode the initial string to get token IDs
-        self.input_ids = torch.tensor(
-            tokenizer.encode(
-                initial_string, 
-                return_tensors='pt',
-                add_special_tokens=False,
-            ).to(device),
-            device=device
-        )
+        self.input_ids = tokenizer.encode(
+            initial_string, 
+            return_tensors='pt',
+            add_special_tokens=False,
+        ).to(device)
         
         # Initialize parameters
+        self.logit_scaler = logit_scaler
         self.vocab_size = tokenizer.vocab_size
         self.seq_len = len(self.input_ids[0])
         
         # Initialize logits for the one-hot distribution
         # Start with one-hot encoding of the input_ids
         self.logits = nn.Parameter(
-            F.one_hot(self.input_ids, num_classes=self.vocab_size).float().to(device),
-            requires_grad=True
+            self.logit_scaler*F.one_hot(self.input_ids, num_classes=self.vocab_size).float().to(device),
+            requires_grad=True,
         )
         
         # Initialize STGS module
@@ -64,6 +64,8 @@ class STGSDiffString(nn.Module):
             learnable_temperature=learnable_temperature,
             device=device
         )
+
+        self.eff_temperature = 0.0
     
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """
@@ -76,15 +78,13 @@ class STGSDiffString(nn.Module):
                 - decoded_string: The decoded string from the current distribution
         """
         # Apply STGS to get differentiable samples
-        diff_output_ids, diff_one_hot, _, _ = self.stgs(self.logits)
-        
-        input_ids = diff_output_ids#.long()
-        one_hot = diff_one_hot
+        diff_input_ids, diff_one_hot, eff_temperature, _ = self.stgs(self.logits)
+        self.eff_temperature = eff_temperature.data.mean().item()
 
         # Decode the string
-        decoded_string = self.tokenizer.decode(input_ids.long()[0].tolist())
+        decoded_string = self.tokenizer.decode(diff_input_ids.long()[0].tolist())
 
-        return input_ids, one_hot, decoded_string
+        return diff_input_ids, diff_one_hot, decoded_string
 
     def update(self):
         """Update the current logits based on a previously computed gradient."""
@@ -106,8 +106,13 @@ class STGSDiffString(nn.Module):
     
     def get_input_ids(self) -> torch.Tensor:
         """Get the current differentiable input_ids."""
-        input_ids, _, _ = self.forward()
-        return input_ids
+        diff_input_ids, _, _ = self.forward()
+        return diff_input_ids
+    
+    def get_one_hot(self) -> torch.Tensor:
+        """Get the current differentiable one-hot encoding."""
+        _, diff_one_hot, _ = self.forward()
+        return diff_one_hot
     
     def __str__(self) -> str:
         return self.get_string()

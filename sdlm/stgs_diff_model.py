@@ -1,12 +1,44 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
+from typing import Optional, Dict, Union
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 from torch import Tensor
 
 from .stgs import STGS
 
+class STGSOutput(CausalLMOutputWithPast):
+    def __init__(self, *args, **kwargs):
+        # Pop our custom fields before calling parent's __init__
+        self.stgs_logits = kwargs.pop('stgs_logits', None)
+        self.sampled_diff_tokens = kwargs.pop('sampled_diff_tokens', None)
+        self.sampled_diff_one_hot = kwargs.pop('sampled_diff_one_hot', None)
+        self.temperature = kwargs.pop('temperature', None)
+        super().__init__(*args, **kwargs)
+    
+    stgs_logits: Tensor
+    sampled_diff_tokens: Tensor
+    sampled_diff_one_hot: Tensor
+    temperature: Tensor
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+
+    def __contains__(self, key):
+        return hasattr(self, key)
+
+    def __iter__(self):
+        return iter(self.__dict__.keys())
+
+    def __len__(self):
+        return len(self.__dict__)
+
+    def __repr__(self):
+        return f"STGSOutput({self.__dict__})"
 
 class STGSDiffModel(PreTrainedModel):
     """
@@ -26,10 +58,13 @@ class STGSDiffModel(PreTrainedModel):
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
         temperature: float = 1.0,
-        hard: bool = False,
-        learnable_temperature: bool = False,
-        conditioning_dim: int = 0,
-        device: str = None,
+        stgs_kwargs: Dict[str, bool] = {
+            "stgs_hard": False,
+            "init_temperature": 1.0,
+            "learnable_temperature": False,
+            "hidden_state_conditioning": False,
+        },
+        device: Optional[str] = None,
     ):
         # Initialize with the config from the base model
         super().__init__(model.config)
@@ -41,13 +76,15 @@ class STGSDiffModel(PreTrainedModel):
         assert self.device == device or device is None 
         
         # Initialize STGS module
+        self.stgs_kwargs = stgs_kwargs
+        conditioning_dim = 0 if not self.stgs_kwargs["hidden_state_conditioning"] else self.model.config.hidden_size
         self.stgs = STGS(
             vocab_size=self.vocab_size,
-            stgs_hard=hard,
-            init_temperature=temperature,
-            learnable_temperature=learnable_temperature,
+            stgs_hard=self.stgs_kwargs["stgs_hard"],
+            init_temperature=self.stgs_kwargs["init_temperature"],
+            learnable_temperature=self.stgs_kwargs["learnable_temperature"],
             conditioning_dim=conditioning_dim,
-            device=self.device
+            device=self.device,
         )
         
         # Move model to device
@@ -56,6 +93,7 @@ class STGSDiffModel(PreTrainedModel):
     def forward(
         self,
         input_ids: Optional[Tensor] = None,
+        input_one_hots: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
         inputs_embeds: Optional[Tensor] = None,
@@ -63,21 +101,23 @@ class STGSDiffModel(PreTrainedModel):
         output_past_key_values: bool = True,
         return_dict: bool = True,
         **kwargs
-    ) -> Dict[str, Tensor]:
+    ) -> Union[STGSOutput, Tensor]:
         """
         Forward pass with STGS sampling.
         
         Args:
             input_ids: Input token IDs (batch_size, seq_len)
+            input_one_hots: Optional precomputed one-hot representation
             attention_mask: Attention mask (batch_size, seq_len)
             labels: Target token IDs for loss computation
             inputs_embeds: Optional precomputed embeddings
             output_hidden_states: Whether to output hidden states
-            return_dict: Whether to return a dictionary of outputs
+            return_dict: Whether to return an STGSOutput dictionary of outputs or a tensor of differentiable one-hot sampled tokens
             **kwargs: Additional arguments for the model
             
         Returns:
-            Dict containing:
+            Union[STGSOutput, Tensor]:
+            if return_dict=True, STGSOutput containing:
                 - logits: Original model logits
                 - stgs_logits: Logits after STGS sampling
                 - sampled_tokens: Sampled token IDs (discrete and differentiable)
@@ -85,7 +125,14 @@ class STGSDiffModel(PreTrainedModel):
                 - temperature: Sampling temperature
                 - hidden_states: Tuple of hidden states if output_hidden_states=True
                 - loss: Computed loss if labels are provided
+            or
+            Tensor of differentiable one-hot sampled tokens if return_dict=False
         """
+
+        if input_one_hots is not None:
+            assert inputs_embeds is None and input_ids is None
+            inputs_embeds = torch.matmul(input_one_hots, self.model.get_input_embeddings().weight)
+        
         # Get model outputs
         outputs = self.model(
             input_ids=input_ids,
@@ -117,28 +164,29 @@ class STGSDiffModel(PreTrainedModel):
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         
         # Prepare output
-        output_dict = {
-            'logits': logits,
-            'stgs_logits': stgs_logits,
-            'sampled_diff_tokens': diff_output_ids,
-            'sampled_diff_one_hot': diff_one_hot,
-            'temperature': temperature,
-            'loss': loss, 
-        }
+        output_dict: STGSOutput = STGSOutput(
+            logits=logits,
+            stgs_logits=stgs_logits,
+            sampled_diff_tokens=diff_output_ids,
+            sampled_diff_one_hot=diff_one_hot,
+            temperature=temperature,
+            loss=loss, 
+        )
         
         if output_hidden_states and hidden_states is not None:
-            output_dict['hidden_states'] = hidden_states
+            output_dict.hidden_states = hidden_states
         if output_past_key_values and outputs.past_key_values is not None:
-            output_dict['past_key_values'] = outputs.past_key_values    
+            output_dict.past_key_values = outputs.past_key_values    
 
         if return_dict:
             return output_dict
         else:
-            return logits
+            return diff_one_hot
     
     def generate(
         self,
         input_ids: Optional[Tensor] = None,
+        input_one_hots: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,
         max_length: int = 50,
         temperature: Optional[float] = None,
@@ -151,6 +199,7 @@ class STGSDiffModel(PreTrainedModel):
         
         Args:
             input_ids: Input token IDs (batch_size, seq_len)
+            input_one_hots: Input one-hot representation (batch_size, seq_len, vocab_size)
             attention_mask: Attention mask (batch_size, seq_len)
             max_length: Maximum length of generated sequence
             temperature: Sampling temperature (overrides the initialized value if provided)
@@ -159,7 +208,7 @@ class STGSDiffModel(PreTrainedModel):
             **kwargs: Additional arguments for generation
             
         Returns:
-            Tensor of generated token IDs (batch_size, max_length)
+            Tensor of differentiable one-hot sampled tokens (batch_size, max_length)
         """
         if use_bpttoken and num_beams > 1:
             raise ValueError("BPTT is not compatible with beam search (num_beams > 1)")
@@ -175,123 +224,109 @@ class STGSDiffModel(PreTrainedModel):
             self.stgs.init_temperature = temperature
         
         # Prepare inputs
-        if input_ids is None:
-            input_ids = torch.tensor([[self.tokenizer.bos_token_id or self.tokenizer.eos_token_id]], 
-                                   device=self.device)
+        if input_ids is None and input_one_hots is None:
+            raise ValueError("At least one of input_ids or input_one_hots must be provided")
         
-        batch_size = input_ids.size(0)
+        if input_ids is not None:
+            batch_size = input_ids.size(0)
+            input_len = input_ids.size(1)
+        elif input_one_hots is not None:
+            batch_size = input_one_hots.size(0)
+            input_len = input_one_hots.size(1)
         
-        if attention_mask is None and input_ids is not None:
-            attention_mask = (input_ids != self.pad_token_id).long()
+        if attention_mask is None:
+            if input_ids is not None:
+                attention_mask = (input_ids != self.pad_token_id).long()
+            elif input_one_hots is not None:
+                attention_mask = (input_one_hots.sum(-1) != 0).long()
         
         # Get embedding layer
         embedding_layer = self.model.get_input_embeddings()
         
-        # If using BPTToken, we need to handle the generation differently
-        if use_bpttoken:
-            # Prepare for BPTToken generation
-            past_key_values = None
-            all_logits = []
-            
-            # Initial forward pass
+        # Generate inputs_embeds:
+        if input_ids is not None:
+            inputs_embeds = embedding_layer(input_ids)
+        elif input_one_hots is not None:
+            inputs_embeds = torch.matmul(input_one_hots, embedding_layer.weight.unsqueeze(0))
+        
+        all_one_hot = []
+        
+        # Initial forward pass
+        outputs = self.forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            output_past_key_values=True,
+            use_cache=True,
+            return_dict=True,
+            **kwargs
+        )
+        
+        next_token_logits = outputs.logits[:,-1:]
+        next_token_stgs_logits = outputs.stgs_logits[:,-1:]
+        next_token_id = next_token_logits.argmax(-1)
+        next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:]
+        next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
+        next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
+        
+        all_one_hot.append(next_token_stgs_one_hot)            
+
+        # Get embeddings for the next token
+        next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
+        # batch_size x 1 x embedding_dim
+
+        if not use_bpttoken:
+            next_token_embedding = next_token_embedding.detach()
+        
+        attention_mask = torch.cat([
+            attention_mask,
+            torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
+        ], dim=-1)
+        # batch_size x seq_len+1
+
+        # Generation loop with BPTT
+        for it in range(1, max_length - input_len + 1):
+            # Forward pass with past key values for efficient generation
             outputs = self.forward(
-                input_ids=input_ids,
+                inputs_embeds=next_token_embedding,
                 attention_mask=attention_mask,
+                past_key_values=outputs.past_key_values,
                 output_hidden_states=True,
-                output_past_key_values=True,
                 use_cache=True,
                 return_dict=True,
                 **kwargs
             )
             
-            # Get logits and filter if needed
-            logits = outputs['logits']
-            all_logits.append(logits[:, -1:, :])
-            
-            # Get next token using STGS
-            next_token_diff, next_token_one_hot = \
-                outputs['sampled_diff_tokens'][:,-1:], outputs['sampled_diff_one_hot'][:,-1:]
-            # batch_size x 1
-            # batch_size x 1 x vocab_size
+            # Get elements for ONLY THE NEXT TOKEN:
+            next_token_logits = outputs.logits[:,-1:]
+            next_token_stgs_logits = outputs.stgs_logits[:,-1:]
+            next_token_id = next_token_logits.argmax(-1)
+            next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:]
+            next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
+            next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
+            all_one_hot.append(next_token_stgs_one_hot)
 
             # Get embeddings for the next token
-            next_token_embedding = torch.matmul(next_token_one_hot, embedding_layer.weight.unsqueeze(0))
+            next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
             # batch_size x 1 x embedding_dim
-
-            # Update input sequence
-            input_ids = torch.cat([input_ids, next_token_diff.long()], dim=-1)
+            
+            if not use_bpttoken:
+                next_token_embedding = next_token_embedding.detach()
+            
             attention_mask = torch.cat([
                 attention_mask,
                 torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
             ], dim=-1)
-            # batch_size x seq_len+1
-
-            # Generation loop with BPTT
-            for it in range(1, max_length - input_ids.size(1) + 1):
-                # Forward pass with past key values for efficient generation
-                outputs = self.forward(
-                    inputs_embeds=next_token_embedding,
-                    #attention_mask=attention_mask,
-                    past_key_values=outputs['past_key_values'],
-                    output_hidden_states=True,
-                    use_cache=True,
-                    return_dict=True,
-                    **kwargs
-                )
-                
-                # Get logits for ONLY THE NEXT TOKEN:
-                logits = outputs['logits']
-                all_logits.append(logits)
-                # batch_size x 1 x vocab_size
-                # batch_size x [seq_len+1] x vocab_size
-
-                # Get next token differentiable elements:
-                next_token_diff, next_token_one_hot = \
-                    outputs['sampled_diff_tokens'], outputs['sampled_diff_one_hot']
-                # batch_size x 1
-                # batch_size x 1 x vocab_size
-                
-                # Get embeddings for the next token
-                next_token_embedding = torch.matmul(next_token_one_hot, embedding_layer.weight.unsqueeze(0))
-                # batch_size x 1 x embedding_dim
-                
-                # Update input sequence
-                input_ids = torch.cat([input_ids, next_token_diff.long()], dim=-1)
-                # batch_size x seq_len+it+1
-                attention_mask = torch.cat([
-                    attention_mask,
-                    torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
-                ], dim=-1)
-                # batch_size x seq_len+it+1
-        else:
-            # Standard generation without BPTT
-            for it in range(max_length - input_ids.size(1)):
-                # Get model outputs
-                outputs = self.forward(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    **kwargs
-                )
-                
-                # Get next token (greedy sampling from STGS distribution)
-                next_token = outputs['sampled_diff_tokens'][:, -1:]
-                # batch_size x 1
-                
-                # Update input_ids and attention_mask
-                input_ids = torch.cat([input_ids, next_token.long()], dim=-1)
-                # batch_size x seq_len+it+1
-                attention_mask = torch.cat([
-                    attention_mask, 
-                    torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
-                ], dim=-1)
-                # batch_size x seq_len+it+1
-            
+            # batch_size x seq_len+it+1
+        
+        all_one_hot = torch.cat(all_one_hot, dim=1)
+        # batch_size x max_length x vocab_size
+        
         # Restore original mode and temperature
         self.train(original_mode)
         self.stgs.init_temperature = original_temp
         
-        return input_ids
+        return all_one_hot
     
     def to(self, device=None, *args, **kwargs):
         """Moves the model to the specified device."""
