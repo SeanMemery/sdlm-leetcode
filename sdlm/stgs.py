@@ -51,18 +51,26 @@ class STGS(nn.Module):
                     nn.Softplus()
                 ).to(device=device)
 
-    def forward(self, x: Tensor, hidden_states: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward(
+        self, 
+        x: Tensor, 
+        temperature: Optional[float] = None,
+        hidden_states: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass with STGS sampling.
         
         Args:
             x: Input logits (batch_size, seq_len, vocab_size)
+            temperature: Optional temperature to use for Gumbel-Softmax sampling
             hidden_states: Optional hidden states for conditional temperature
             
         Returns:
             Tuple of (sampled_tokens, sampled_probs, temperature)
         """
-        if self.learnable_temperature:
+        if temperature is not None:
+            eff_temperature = torch.tensor([temperature], device=self.device)
+        elif self.learnable_temperature:
             if self.conditioning_dim < 1:
                 eff_temperature = F.softplus(self.temperature_param) + self.init_temperature
             else:

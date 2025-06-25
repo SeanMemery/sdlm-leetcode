@@ -48,16 +48,13 @@ class STGSDiffModel(PreTrainedModel):
     Args:
         model: A HuggingFace PreTrainedModel
         tokenizer: The corresponding tokenizer
-        temperature: Initial temperature for Gumbel-Softmax
-        hard: If True, uses hard (discrete) samples in forward pass
-        learnable_temperature: If True, makes temperature a learnable parameter
-        conditioning_dim: Dimension of conditioning vector for adaptive temperature (0 for fixed temperature)
+        stgs_kwargs: Dictionary of STGS parameters
+        device: Device to run the model on
     """
     def __init__(
         self,
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
-        temperature: float = 1.0,
         stgs_kwargs: Dict[str, bool] = {
             "stgs_hard": False,
             "init_temperature": 1.0,
