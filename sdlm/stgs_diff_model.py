@@ -136,7 +136,7 @@ class STGSDiffModel(PreTrainedModel):
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
-            output_past_key_values=output_past_key_values,
+            use_cache=True, #output_past_key_values=output_past_key_values,
             return_dict=True,
             **kwargs
         )
