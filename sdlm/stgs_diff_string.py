@@ -19,8 +19,8 @@ class STGSDiffString(nn.Module):
         tokenizer: PreTrainedTokenizer,
         initial_string: Optional[str] = None,
         initial_ids: Optional[torch.Tensor] = None,
-        logit_scaler: float = 1.0,
-        temperature: float = 1.0,
+        logit_scaler: float = 10.0,
+        temperature: float = 0.1,
         hard: bool = False,
         learnable_temperature: bool = False,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -127,7 +127,7 @@ class STGSDiffString(nn.Module):
             self.logits,
             temperature=temperature,
         )
-        self.eff_temperature = eff_temperature.data.mean().item()
+        self.eff_temperature = (eff_temperature.sum()/len(eff_temperature)).item()
 
         # Decode the string
         decoded_string = self.tokenizer.decode(diff_input_ids.long()[0].tolist())

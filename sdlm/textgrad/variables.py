@@ -23,7 +23,8 @@ class Variable(STGSDiffString):
         initial_string: Optional[str] = None,
         initial_ids: Optional[torch.Tensor] = None,
         name: Optional[str] = None,
-        temperature: float = 1.0,
+        temperature: float = 0.1,
+        logit_scaler: float = 10.0,
         hard: bool = False,
         learnable_temperature: bool = False,
         device: Optional[str] = None,
@@ -51,6 +52,7 @@ class Variable(STGSDiffString):
             initial_ids=initial_ids,
             tokenizer=tokenizer,
             temperature=temperature,
+            logit_scaler=logit_scaler,
             hard=hard,
             learnable_temperature=learnable_temperature,
             device=device

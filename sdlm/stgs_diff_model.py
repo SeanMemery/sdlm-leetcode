@@ -77,8 +77,8 @@ class STGSDiffModel(PreTrainedModel):
         conditioning_dim = 0 if not self.stgs_kwargs["hidden_state_conditioning"] else self.model.config.hidden_size
         self.stgs = STGS(
             vocab_size=self.vocab_size,
-            stgs_hard=self.stgs_kwargs["stgs_hard"],
-            init_temperature=self.stgs_kwargs["init_temperature"],
+            stgs_hard=self.stgs_kwargs["hard"],
+            init_temperature=self.stgs_kwargs["temperature"],
             learnable_temperature=self.stgs_kwargs["learnable_temperature"],
             conditioning_dim=conditioning_dim,
             device=self.device,
