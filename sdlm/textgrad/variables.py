@@ -21,6 +21,7 @@ class Variable(STGSDiffString):
         self, 
         tokenizer: PreTrainedTokenizer,
         initial_string: Optional[str] = None,
+        init_strategy: Optional[str] = "random",
         initial_ids: Optional[torch.Tensor] = None,
         name: Optional[str] = None,
         temperature: float = 0.1,
@@ -28,7 +29,8 @@ class Variable(STGSDiffString):
         hard: bool = False,
         learnable_temperature: bool = False,
         device: Optional[str] = None,
-        constraint: Optional[Callable] = None
+        constraint: Optional[Callable] = None,
+        **kwargs,
     ):
         """
         Initialize a Variable.
@@ -36,6 +38,7 @@ class Variable(STGSDiffString):
         Args:
             tokenizer: Tokenizer to use for text processing
             initial_string: Initial text content
+            init_strategy: strategy to initialize the variable's logits ("random", "fluency").
             initial_ids: Initial token IDs
             name: Optional name for the variable (for debugging)
             temperature: Sampling temperature for Gumbel-Softmax
@@ -50,6 +53,7 @@ class Variable(STGSDiffString):
         super().__init__(
             initial_string=initial_string,
             initial_ids=initial_ids,
+            init_strategy=init_strategy,
             tokenizer=tokenizer,
             temperature=temperature,
             logit_scaler=logit_scaler,

@@ -19,6 +19,7 @@ class STGSDiffString(nn.Module):
         tokenizer: PreTrainedTokenizer,
         initial_string: Optional[str] = None,
         initial_ids: Optional[torch.Tensor] = None,
+        init_strategy: str = "random",
         logit_scaler: float = 10.0,
         temperature: float = 0.1,
         hard: bool = False,
@@ -32,6 +33,7 @@ class STGSDiffString(nn.Module):
             tokenizer: A tokenizer with encode() and decode() methods
             initial_string: The initial string to represent
             initial_ids: The initial token IDs to represent
+            init_strategy: The initialization strategy to use
             logit_scaler: Scalar to scale the logits
             temperature: Initial temperature for Gumbel-Softmax
             hard: If True, uses straight-through estimator with hard samples
@@ -45,6 +47,7 @@ class STGSDiffString(nn.Module):
         assert initial_string is not None or initial_ids is not None
         if initial_ids is not None:
             self.input_ids = initial_ids.to(device)
+            initial_string = tokenizer.decode(initial_ids[0])
         else:
             # Encode the initial string to get token IDs
             self.input_ids = tokenizer.encode(
@@ -59,11 +62,51 @@ class STGSDiffString(nn.Module):
         self.seq_len = len(self.input_ids[0])
         
         # Initialize logits for the one-hot distribution
-        # Start with one-hot encoding of the input_ids
-        self.logits = nn.Parameter(
-            self.logit_scaler*F.one_hot(self.input_ids, num_classes=self.vocab_size).float().to(device),
-            requires_grad=True,
-        )
+        self.init_strategy = init_strategy
+        if self.init_strategy == "random":
+            # Start with one-hot encoding of the input_ids
+            self.logits = nn.Parameter(
+                self.logit_scaler*F.one_hot(self.input_ids, num_classes=self.vocab_size).float().to(device),
+                requires_grad=True,
+            )
+        elif self.init_strategy == "fluency":
+            # Start with a logit distribution similar to the fluency model's next_token distribution:
+            import sdlm
+            fluency_model = sdlm._manager.get_fluency_model()
+            fluency_tokenizer = sdlm._manager.get_fluency_tokenizer()
+            fm_input = fluency_tokenizer.encode(
+                initial_string, 
+                return_tensors='pt',
+                add_special_tokens=True,
+            ).to(fluency_model.device)
+            fm_output = fluency_model(
+                input_ids=fm_input,
+                return_dict=True,
+            )
+            # remove batch dimension and last token prediction: 
+            logits = fm_output.logits[0][:-1]
+            # add initial token as max logit:
+            logit_max = logits.max()
+            first_token_logits = logits.mean()*torch.ones((1, self.vocab_size), device=device)
+            first_token_logits[0,self.input_ids[0][0]] = (1+logit_max)
+            # (1, vocab_size)
+            logits = torch.cat([
+                first_token_logits,
+                logits,
+            ], dim=0)
+            # (1+(seq_len-1), vocab_size)
+            # add slight bump on initial_string logits:
+            logits = logits.scatter(
+                dim=-1,
+                index=self.input_ids[0].unsqueeze(1),
+                src=(1+logit_max)*torch.ones_like(logits),
+            )
+            assert all(logits.argmax(dim=-1) == self.input_ids[0])
+            self.logits = nn.Parameter(
+                logits.detach().to(self.device),
+                requires_grad=True,
+            )
+            
         
         # Initialize STGS module
         self.stgs = STGS(
@@ -149,7 +192,7 @@ class STGSDiffString(nn.Module):
     
     def get_string(self) -> str:
         """Get the current string representation."""
-        _, _, decoded_string = self.forward(temperature=1.0)
+        _, _, decoded_string = self.forward(temperature=0.1)
         return decoded_string
     
     def get_input_ids(self) -> torch.Tensor:

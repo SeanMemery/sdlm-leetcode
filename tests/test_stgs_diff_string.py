@@ -22,6 +22,30 @@ class TestSTGSDiffString:
         assert isinstance(diff_string.get_string(), str)
         assert isinstance(diff_string.get_input_ids(), torch.Tensor)
         assert len(diff_string) > 0
+
+    def test_init_strategies(self, test_model_and_tokenizer, test_string, device):
+        """
+        Test that the different init stratey yieds different logits.
+        """
+        _, tokenizer = test_model_and_tokenizer
+        diff_string = STGSDiffString(
+            initial_string=test_string,
+            tokenizer=tokenizer,
+            device=device,
+            init_strategy="fluency",
+        )
+        diff_string_fluency = diff_string.logits.clone()
+        
+        diff_string = STGSDiffString(
+            initial_string=test_string,
+            tokenizer=tokenizer,
+            device=device,
+            init_strategy="random",
+        )
+        diff_string_random = diff_string.logits.clone()
+        
+        # Test basic properties
+        assert not torch.allclose(diff_string_fluency, diff_string_random)
     
     def test_forward_pass(self, test_model_and_tokenizer, test_string, device):
         _, tokenizer = test_model_and_tokenizer
