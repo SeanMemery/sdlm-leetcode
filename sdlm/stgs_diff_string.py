@@ -84,10 +84,10 @@ class STGSDiffString(nn.Module):
                 return_dict=True,
             )
             # remove batch dimension and last token prediction: 
-            logits = fm_output.logits[0][:-1]
+            logits = fm_output.logits[0][:-1].to(self.input_ids.device)
             # add initial token as max logit:
             logit_max = logits.max()
-            first_token_logits = logits.mean()*torch.ones((1, self.vocab_size), device=device)
+            first_token_logits = logits.mean()*torch.ones((1, self.vocab_size), device=logits.device)
             first_token_logits[0,self.input_ids[0][0]] = (1+logit_max)
             # (1, vocab_size)
             logits = torch.cat([
@@ -98,12 +98,12 @@ class STGSDiffString(nn.Module):
             # add slight bump on initial_string logits:
             logits = logits.scatter(
                 dim=-1,
-                index=self.input_ids[0].unsqueeze(1),
+                index=self.input_ids[0].unsqueeze(1).to(logits.device),
                 src=(1+logit_max)*torch.ones_like(logits),
             )
             assert all(logits.argmax(dim=-1) == self.input_ids[0])
             self.logits = nn.Parameter(
-                logits.detach().to(self.device),
+                logits.detach().to(self.device).unsqueeze(0), # adding the batch dim...
                 requires_grad=True,
             )
             
@@ -174,7 +174,7 @@ class STGSDiffString(nn.Module):
 
         # Decode the string
         decoded_string = self.tokenizer.decode(diff_input_ids.long()[0].tolist())
-
+        
         return diff_input_ids, diff_one_hot, decoded_string
 
     def update(self):

@@ -77,7 +77,7 @@ class STGS(nn.Module):
                 assert hidden_states is not None
                 batch_size = x.shape[0]
                 seq_len = x.shape[1]
-                last_hidden_state = hidden_states[-1][:,-1,:].reshape(batch_size, self.conditioning_dim)
+                last_hidden_state = hidden_states[-1][:,-1,:].reshape(batch_size, self.conditioning_dim).float()
                 self.inv_tau0 = 1.0/(self.eps+self.init_temperature)
                 eff_temperature = self.eps + 1. / (self.tau_fc(last_hidden_state)+self.inv_tau0).reshape(batch_size, -1, 1)
                 eff_temperature = eff_temperature.repeat(1, seq_len, 1)
