@@ -61,6 +61,7 @@ class STGSDiffModel(PreTrainedModel):
             "learnable_temperature": False,
             "hidden_state_conditioning": False,
         },
+        stgs_logits_generation: Optional[bool] = True,
         device: Optional[str] = None,
     ):
         # Initialize with the config from the base model
@@ -75,6 +76,7 @@ class STGSDiffModel(PreTrainedModel):
         # Initialize STGS module
         self.stgs_kwargs = stgs_kwargs
         conditioning_dim = 0 if not self.stgs_kwargs["hidden_state_conditioning"] else self.model.config.hidden_size
+        self.stgs_logits_generation = stgs_logits_generation
         self.stgs = STGS(
             vocab_size=self.vocab_size,
             stgs_hard=self.stgs_kwargs["hard"],
@@ -269,7 +271,11 @@ class STGSDiffModel(PreTrainedModel):
         all_one_hot.append(next_token_stgs_one_hot)            
 
         # Get embeddings for the next token
-        next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
+        if self.stgs_logits_generation:
+            next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
+        else:
+            next_token_logits_distr = torch.softmax(next_token_logits, dim=-1)
+            next_token_embedding = torch.matmul(next_token_logits_distr, embedding_layer.weight.unsqueeze(0))
         # batch_size x 1 x embedding_dim
 
         if not use_bpttoken:
@@ -304,7 +310,12 @@ class STGSDiffModel(PreTrainedModel):
             all_one_hot.append(next_token_stgs_one_hot)
 
             # Get embeddings for the next token
-            next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
+            #next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
+            if self.stgs_logits_generation:
+                next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
+            else:
+                next_token_logits_distr = torch.softmax(next_token_logits, dim=-1)
+                next_token_embedding = torch.matmul(next_token_logits_distr, embedding_layer.weight.unsqueeze(0))
             # batch_size x 1 x embedding_dim
             
             if not use_bpttoken:
