@@ -136,6 +136,7 @@ class TensorString(_original_str):
     def configure_model(
         cls, 
         model_name: str,
+        model: Optional[AutoModelForCausalLM] = None,
     ) -> None:
         """
         Configure the default model for all TensorString instances.
@@ -150,9 +151,12 @@ class TensorString(_original_str):
                 use_fast=True
             )
         if model_name not in cls._model_cache:
-            cls._model_cache[model_name] = AutoModelForCausalLM.from_pretrained(
-                model_name,
-            ).to(cls._global_device)
+            if model is None:
+                cls._model_cache[model_name] = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                ).to(cls._global_device)
+            else:
+                cls._model_cache[model_name] = model.to(cls._global_device)
    
     @classmethod
     def set_global_device(
