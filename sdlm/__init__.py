@@ -65,24 +65,26 @@ class SDLMManager:
     def configure_default_model(
         self, 
         model_name: str,
+        model: Optional[AutoModelForCausalLM] = None,
         default: Optional[str] = 'default',
     ):
         """
         Configure the default model for TensorString operations.
         """
         self.default_model = model_name
-        TensorString.configure_model(model_name)
+        TensorString.configure_model(model_name=model_name, model=model)
         print(f"SDLM: Configured {default} model: {model_name}")
     
     def configure_fluency_model(
         self,
         model_name: str,
+        model: Optional[AutoModelForCausalLM] = None,
     ):
         """
         Configure the fluency model for TensorString and STGSDiffString.
         """
         # Fluency model is the default model
-        self.configure_default_model(model_name, default='fluency')
+        self.configure_default_model(model_name, model=model, default='fluency')
                  
     def get_fluency_model(self) -> AutoModelForCausalLM:
         return TensorString.fluency_model()
@@ -210,11 +212,14 @@ def with_tensor_strings():
     """
     return _manager.with_tensor_strings()
 
-def configure_default_model(model_name: str):
+def configure_default_model(
+    model_name: str,
+    model: Optional[AutoModelForCausalLM] = None,
+    ):
     """
     Configure the default model for all TensorString operations.
     """
-    _manager.configure_default_model(model_name)
+    _manager.configure_default_model(model_name, model=model)
 
 def set_device(device: Union[str, torch.device]):
     """
