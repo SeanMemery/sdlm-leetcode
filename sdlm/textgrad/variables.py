@@ -19,8 +19,9 @@ class Variable(STGSDiffString):
     
     def __init__(
         self, 
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Optional[PreTrainedTokenizer] = None,
         initial_string: Optional[str] = None,
+        initial_str: Optional[str] = None,  # Alternative name for initial_string
         init_strategy: Optional[str] = "random",
         initial_ids: Optional[torch.Tensor] = None,
         name: Optional[str] = None,
@@ -30,6 +31,8 @@ class Variable(STGSDiffString):
         learnable_temperature: bool = False,
         device: Optional[str] = None,
         constraint: Optional[Callable] = None,
+        template: Optional[str] = None,
+        use_fluency_constraint: bool = False,
         **kwargs,
     ):
         """
@@ -47,8 +50,16 @@ class Variable(STGSDiffString):
             device: Device to use (cuda/cpu)
             constraint: Optional constraint function to apply to gradients
         """
+        # Handle alternative parameter names
+        if initial_str is not None:
+            initial_string = initial_str
+        
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Handle fluency constraint  
+        if use_fluency_constraint and init_strategy == "random":
+            init_strategy = "fluency"
             
         super().__init__(
             initial_string=initial_string,
@@ -61,6 +72,9 @@ class Variable(STGSDiffString):
             learnable_temperature=learnable_temperature,
             device=device
         )
+        
+        self.template = template
+        self.use_fluency_constraint = use_fluency_constraint
         
         self.name = name or f"var_{id(self)}"
         self._grad = None
@@ -122,15 +136,41 @@ class Variable(STGSDiffString):
             constraint: Function that takes a gradient tensor and returns a modified gradient tensor
         """
         self._constraint = constraint
+    
+    def forward_sample(self, temperature: Optional[float] = None) -> str:
+        """Sample a string from the current distribution."""
+        if temperature is not None:
+            # Temporarily override temperature
+            old_temp = self.stgs.init_temperature
+            self.stgs.init_temperature = temperature
+            
+        try:
+            sample = self.get_string()
+            if self.template:
+                # Apply template formatting
+                sample = self.template.format(VARIABLE=sample)
+            return sample
+        finally:
+            if temperature is not None:
+                # Restore original temperature
+                self.stgs.init_temperature = old_temp
         
-    def __call__(self) -> str:
-        """Return the current string value."""
-        return self.get_string()
+    def __call__(self):
+        """Return the forward pass results: (input_ids, one_hot, decoded)."""
+        return self.forward()
         
     def __str__(self) -> str:
         """String representation of the variable."""
         return f"Variable(name='{self.name}', value='{self.get_string()}')"
         
+    def parameters(self):
+        """Return parameters for optimization."""
+        params = [self.logits]
+        if hasattr(self.stgs, 'learnable_temperature') and self.stgs.learnable_temperature:
+            if hasattr(self.stgs, 'init_temperature') and isinstance(self.stgs.init_temperature, torch.nn.Parameter):
+                params.append(self.stgs.init_temperature)
+        return params
+    
     def clone(self) -> 'Variable':
         """
         Create a deep copy of this Variable.

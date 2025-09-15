@@ -58,7 +58,7 @@ class STGSDiffString(nn.Module):
         
         # Initialize parameters
         self.logit_scaler = logit_scaler
-        self.vocab_size = tokenizer.vocab_size
+        self.vocab_size = len(tokenizer) #tokenizer.vocab_size
         self.seq_len = len(self.input_ids[0])
         
         # Initialize logits for the one-hot distribution
@@ -77,7 +77,7 @@ class STGSDiffString(nn.Module):
             fm_input = fluency_tokenizer.encode(
                 initial_string, 
                 return_tensors='pt',
-                add_special_tokens=True,
+                add_special_tokens=False,
             ).to(fluency_model.device)
             fm_output = fluency_model(
                 input_ids=fm_input,

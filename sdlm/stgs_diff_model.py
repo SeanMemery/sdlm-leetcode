@@ -70,22 +70,28 @@ class STGSDiffModel(PreTrainedModel):
         self.tokenizer = tokenizer
         self.vocab_size = len(tokenizer)
         self.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-        assert self.device == device or device is None 
+        #assert self.device == device or device is None 
         
         # Initialize STGS module
         self.stgs_kwargs = stgs_kwargs
-        conditioning_dim = 0 if not self.stgs_kwargs["hidden_state_conditioning"] else self.model.config.hidden_size
+        # Handle both key styles to avoid KeyError
+        hard = self.stgs_kwargs.get("hard", self.stgs_kwargs.get("stgs_hard", False))
+        temperature = self.stgs_kwargs.get("temperature", self.stgs_kwargs.get("init_temperature", 1.0))
+        learnable_temperature = self.stgs_kwargs.get("learnable_temperature", False)
+        hidden_state_conditioning = self.stgs_kwargs.get("hidden_state_conditioning", False)
+        
+        conditioning_dim = 0 if not hidden_state_conditioning else self.model.config.hidden_size
         self.stgs = STGS(
             vocab_size=self.vocab_size,
-            stgs_hard=self.stgs_kwargs["hard"],
-            init_temperature=self.stgs_kwargs["temperature"],
-            learnable_temperature=self.stgs_kwargs["learnable_temperature"],
+            stgs_hard=hard,
+            init_temperature=temperature,
+            learnable_temperature=learnable_temperature,
             conditioning_dim=conditioning_dim,
-            device=self.device,
+            device=device,
         )
         
         # Move model to device
-        self.model = self.model.to(self.device)
+        self.model = self.model.to(device)
     
     def forward(
         self,
@@ -131,14 +137,16 @@ class STGSDiffModel(PreTrainedModel):
             inputs_embeds = torch.matmul(input_one_hots, self.model.get_input_embeddings().weight)
         
         # Get model outputs
+        # Remove use_cache from kwargs if present to avoid conflict
+        kwargs_filtered = {k: v for k, v in kwargs.items() if k != 'use_cache'}
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
-            use_cache=True, #output_past_key_values=output_past_key_values,
+            use_cache=True,
             return_dict=True,
-            **kwargs
+            **kwargs_filtered
         )
         
         logits = outputs.logits
@@ -346,6 +354,10 @@ class STGSDiffModel(PreTrainedModel):
     def parameters(self, recurse: bool = True):
         """Returns an iterator over model parameters."""
         yield from self.model.parameters(recurse=recurse)
+        yield from self.stgs.parameters()
+    
+    def stgs_parameters(self):
+        """Returns an iterator over STGS-specific parameters."""
         yield from self.stgs.parameters()
     
     def named_parameters(self, prefix: str = '', recurse: bool = True):

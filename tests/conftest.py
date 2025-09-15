@@ -13,7 +13,7 @@ def test_model_and_tokenizer(device):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager")
     return model, tokenizer
 
 @pytest.fixture(scope="session")
