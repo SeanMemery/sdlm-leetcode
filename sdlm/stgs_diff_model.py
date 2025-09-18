@@ -173,6 +173,10 @@ class STGSDiffModel(PreTrainedModel):
             use_cache=True, #output_past_key_values=output_past_key_values,
             return_dict=True,
         ))
+        
+        if self.stgs.learnable_temperature \
+        and self.stgs.conditioning_dim > 1:
+            output_hidden_states = True
 
         outputs = self.model(
             input_ids=input_ids,
