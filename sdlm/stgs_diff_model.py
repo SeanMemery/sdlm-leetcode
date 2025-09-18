@@ -6,22 +6,26 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 from torch import Tensor
 
+import gc
+
 from .stgs import STGS
 
 class STGSOutput(CausalLMOutputWithPast):
     def __init__(self, *args, **kwargs):
         # Pop our custom fields before calling parent's __init__
+        self.input_logits = kwargs.pop('input_logits', None)
         self.stgs_logits = kwargs.pop('stgs_logits', None)
         self.sampled_diff_tokens = kwargs.pop('sampled_diff_tokens', None)
         self.sampled_diff_one_hot = kwargs.pop('sampled_diff_one_hot', None)
         self.temperature = kwargs.pop('temperature', None)
         super().__init__(*args, **kwargs)
     
+    input_logits: Tensor
     stgs_logits: Tensor
     sampled_diff_tokens: Tensor
     sampled_diff_one_hot: Tensor
     temperature: Tensor
-
+    
     def __getitem__(self, key):
         return getattr(self, key)
 
@@ -39,6 +43,35 @@ class STGSOutput(CausalLMOutputWithPast):
 
     def __repr__(self):
         return f"STGSOutput({self.__dict__})"
+
+    def keys(self):
+        """
+        Return a view object that displays a list of all the keys in the instance dictionary.
+        This enables dict-like .keys() method calls.
+        """
+        return self.__dict__.keys()
+    
+    def items(self):
+        """
+        Return a view object that displays a list of key-value pairs in the instance dictionary.
+        This enables dict-like .items() method calls.
+        """
+        return self.__dict__.items()
+    
+    def values(self):
+        """
+        Return a view object that displays a list of all the values in the instance dictionary.
+        This enables dict-like .values() method calls.
+        """
+        return self.__dict__.values()
+    
+    def get(self, key, default=None):
+        """
+        Return the value for key if key is in the dictionary, else default.
+        This enables dict-like .get() method calls.
+        """
+        return getattr(self, key, default)
+
 
 class STGSDiffModel(PreTrainedModel):
     """
@@ -97,6 +130,9 @@ class STGSDiffModel(PreTrainedModel):
         labels: Optional[Tensor] = None,
         inputs_embeds: Optional[Tensor] = None,
         output_hidden_states: bool = True,
+        output_diff_tokens: Optional[bool] = False,
+        output_normal_logits: Optional[bool] = False,
+        output_stgs_logits: Optional[bool] = False,
         output_past_key_values: bool = True,
         return_dict: bool = True,
         **kwargs
@@ -133,14 +169,17 @@ class STGSDiffModel(PreTrainedModel):
             inputs_embeds = torch.matmul(input_one_hots, self.model.get_input_embeddings().weight)
         
         # Get model outputs
+        kwargs.update(dict(
+            use_cache=True, #output_past_key_values=output_past_key_values,
+            return_dict=True,
+        ))
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
-            use_cache=True, #output_past_key_values=output_past_key_values,
-            return_dict=True,
-            **kwargs
+            **kwargs,
         )
         
         logits = outputs.logits
@@ -164,9 +203,10 @@ class STGSDiffModel(PreTrainedModel):
         
         # Prepare output
         output_dict: STGSOutput = STGSOutput(
-            logits=logits,
-            stgs_logits=stgs_logits,
-            sampled_diff_tokens=diff_output_ids,
+            input_logits=outputs.logits[:,:-1],
+            logits=logits if output_normal_logits else None,
+            stgs_logits=stgs_logits if output_stgs_logits else None,
+            sampled_diff_tokens=diff_output_ids if output_diff_tokens else None,
             sampled_diff_one_hot=diff_one_hot,
             temperature=temperature,
             loss=loss, 
@@ -187,8 +227,13 @@ class STGSDiffModel(PreTrainedModel):
         input_ids: Optional[Tensor] = None,
         input_one_hots: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,
-        max_length: int = 50,
+        max_length: Optional[int] = None,
+        max_new_tokens: Optional[int] = 256,
         temperature: Optional[float] = None,
+        output_hidden_states: Optional[bool] = False,
+        output_diff_tokens: Optional[bool] = False,
+        output_normal_logits: Optional[bool] = False,
+        output_stgs_logits: Optional[bool] = False,
         num_beams: int = 1,
         use_bpttoken: bool = False,
         **kwargs
@@ -209,6 +254,8 @@ class STGSDiffModel(PreTrainedModel):
         Returns:
             Tensor of differentiable one-hot sampled tokens (batch_size, max_length)
         """
+        return_dict = kwargs.get('return_dict', False)
+        
         if use_bpttoken and num_beams > 1:
             raise ValueError("BPTT is not compatible with beam search (num_beams > 1)")
             
@@ -248,26 +295,60 @@ class STGSDiffModel(PreTrainedModel):
         elif input_one_hots is not None:
             inputs_embeds = torch.matmul(input_one_hots, embedding_layer.weight.unsqueeze(0))
         
+        # Prepare output
+        '''
+        output_dict: STGSOutput = STGSOutput(
+            logits=logits,
+            stgs_logits=stgs_logits,
+            sampled_diff_tokens=diff_output_ids,
+            sampled_diff_one_hot=diff_one_hot,
+            temperature=temperature,
+            loss=loss, 
+        )
+        '''
+        all_dict = {
+            #'input_logits': [],
+            'logits':[],
+            'stgs_logits':[],
+            'sampled_diff_tokens':[],
+            'sampled_diff_one_hot':[],
+            'temperature':[],
+            'loss':[],
+        }
         all_one_hot = []
         
         # Initial forward pass
-        outputs = self.forward(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
+        kwargs.update(dict(
+            output_hidden_states=output_hidden_states,
+            output_diff_tokens=output_diff_tokens,
+            output_normal_logits=output_normal_logits,
+            output_stgs_logits=output_stgs_logits,
             output_past_key_values=True,
             use_cache=True,
             return_dict=True,
-            **kwargs
+        ))
+        outputs = self.forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            **kwargs,
         )
         
-        next_token_logits = outputs.logits[:,-1:]
-        next_token_stgs_logits = outputs.stgs_logits[:,-1:]
-        next_token_id = next_token_logits.argmax(-1)
-        next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:]
-        next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
+        next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
+        next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
+        next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
+        if next_token_logits is not None:
+            next_token_id = next_token_logits.argmax(-1)
+            next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
         next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
-        
+        input_logits = outputs.input_logits
+
+        for ok, ov in outputs.items():
+            if ok not in all_dict \
+            or ov is None:  continue
+            if len(ov.shape) >= 2 \
+            and ok != 'input_logits':
+                ov = ov[:,-1:]
+            all_dict[ok].append(ov)
         all_one_hot.append(next_token_stgs_one_hot)            
 
         # Get embeddings for the next token
@@ -288,25 +369,45 @@ class STGSDiffModel(PreTrainedModel):
         # batch_size x seq_len+1
 
         # Generation loop with BPTT
-        for it in range(1, max_length - input_len + 1):
+        kwargs.update(dict(
+           output_hidden_states=output_hidden_states,
+           use_cache=True,
+           return_dict=True,
+        ))
+        if max_length is not None:
+            max_new_tokens = max_length - input_len +1
+        assert max_new_tokens is not None
+        for it in range(1, max_new_tokens):
             # Forward pass with past key values for efficient generation
+            #torch.cuda.empty_cache()
+            #gc.collect()
+            
             outputs = self.forward(
                 inputs_embeds=next_token_embedding,
                 attention_mask=attention_mask,
                 past_key_values=outputs.past_key_values,
-                output_hidden_states=True,
-                use_cache=True,
-                return_dict=True,
                 **kwargs
             )
             
             # Get elements for ONLY THE NEXT TOKEN:
-            next_token_logits = outputs.logits[:,-1:]
-            next_token_stgs_logits = outputs.stgs_logits[:,-1:]
-            next_token_id = next_token_logits.argmax(-1)
-            next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:]
-            next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
+            next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
+            next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
+            next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
+            if next_token_logits is not None:
+                next_token_id = next_token_logits.argmax(-1)
+                next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
+            else:
+                assert self.stgs_logits_generation
+            
             next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
+
+            for ok, ov in outputs.items():
+                if ok not in all_dict \
+                or ov is None:  continue
+                if len(ov.shape) >= 2 \
+                and ok != 'input_logits':
+                    ov = ov[:,-1:]
+                all_dict[ok].append(ov)
             all_one_hot.append(next_token_stgs_one_hot)
 
             # Get embeddings for the next token
@@ -334,6 +435,24 @@ class STGSDiffModel(PreTrainedModel):
         self.train(original_mode)
         self.stgs.init_temperature = original_temp
         
+        if return_dict:
+            output_dict: STGSOutput = STGSOutput(
+                input_logits=input_logits, #all_dict['input_logits'][-1],
+                logits=torch.cat(all_dict['logits'], dim=1) \
+                if output_normal_logits else None,
+                stgs_logits=torch.cat(all_dict['stgs_logits'], dim=1) \
+                if output_stgs_logits else None,
+                sampled_diff_tokens=torch.cat(all_dict['sampled_diff_tokens'], dim=1) \
+                if output_diff_tokens else None,
+                sampled_diff_one_hot=torch.cat(all_dict['sampled_diff_one_hot'], dim=1),
+                temperature=torch.stack(all_dict['temperature']),
+                loss=torch.stack(all_dict['loss']) if len(all_dict['loss']) else None, 
+            )
+            #torch.cuda.empty_cache()
+            #gc.collect()
+            return output_dict
+        #torch.cuda.empty_cache()
+        #gc.collect()
         return all_one_hot
     
     def to(self, device=None, *args, **kwargs):
