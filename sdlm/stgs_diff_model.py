@@ -112,6 +112,7 @@ class STGSDiffModel(PreTrainedModel):
         self.stgs_kwargs = stgs_kwargs
         conditioning_dim = 0 if not self.stgs_kwargs["hidden_state_conditioning"] else self.model.config.hidden_size
         self.stgs_logits_generation = stgs_logits_generation
+        self.use_bpttoken = stgs_kwargs.get('use_bpttoken', False)
         self.stgs = STGS(
             vocab_size=self.vocab_size,
             stgs_hard=self.stgs_kwargs["hard"],
@@ -259,7 +260,7 @@ class STGSDiffModel(PreTrainedModel):
         output_normal_logits: Optional[bool] = False,
         output_stgs_logits: Optional[bool] = False,
         num_beams: int = 1,
-        use_bpttoken: bool = True,
+        use_bpttoken: bool = False,
         use_diff_tokens: bool = False,
         **kwargs
     ) -> Tensor:
@@ -280,7 +281,8 @@ class STGSDiffModel(PreTrainedModel):
             Tensor of differentiable one-hot sampled tokens (batch_size, max_length)
         """
         return_dict = kwargs.get('return_dict', False)
-        
+        use_bpttoken = use_bpttoken or self.use_bpttoken
+
         if use_bpttoken and num_beams > 1:
             raise ValueError("BPTT is not compatible with beam search (num_beams > 1)")
             
