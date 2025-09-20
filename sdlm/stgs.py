@@ -89,21 +89,23 @@ class STGS(nn.Module):
         )
 
         # Gumbel-Softmax sampling
-        u = torch.rand_like(x)*(0.999-self.eps)+self.eps
-        gumbels = -torch.log( -torch.log(u)).to(
-            device=x.device,
-            dtype=x.dtype,
-        )
+        with torch.no_grad():
+            u = torch.rand_like(x)*(0.999-self.eps)+self.eps
+            gumbels = -torch.log( -torch.log(u)).to(
+                device=x.device,
+                dtype=x.dtype,
+            )
         # batch_size x seq_len x vocab_size
 
-        logits = (x + gumbels)
-        y_soft = F.softmax(logits.float() / eff_temperature, dim=-1)
+        logits = (x + gumbels).float()
+        y_soft = F.softmax(logits / eff_temperature, dim=-1)
         # temperary float conversion to prevent from underflow and breaking Simplex assumption
         # batch_size x seq_len x vocab_size
 
         # Sampling from batched distribution y_soft:
         output_ids = torch.distributions.Categorical(probs=y_soft).sample()
         # batch_size x seq_len
+        del logits
         y_soft = y_soft.to(x.dtype)
 
         # Straight-through: use hard in forward, soft in backward

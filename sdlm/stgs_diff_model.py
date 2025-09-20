@@ -6,6 +6,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 from torch import Tensor
 
+from tqdm import tqdm
 import gc
 
 from .stgs import STGS
@@ -166,7 +167,7 @@ class STGSDiffModel(PreTrainedModel):
 
         if input_one_hots is not None:
             assert inputs_embeds is None and input_ids is None
-            inputs_embeds = torch.matmul(input_one_hots, self.model.get_input_embeddings().weight)
+            inputs_embeds = torch.matmul(input_one_hots, self.model.get_input_embeddings().weight.detach())
         
         # Get model outputs
         kwargs.update(dict(
@@ -185,7 +186,7 @@ class STGSDiffModel(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             **kwargs,
         )
-        
+       
         logits = outputs.logits
         hidden_states = outputs.hidden_states if hasattr(outputs, 'hidden_states') else None
         
@@ -221,6 +222,14 @@ class STGSDiffModel(PreTrainedModel):
         if output_past_key_values and outputs.past_key_values is not None:
             output_dict.past_key_values = outputs.past_key_values    
 
+        '''
+        del outputs
+        del diff_one_hot
+        del stgs_logits
+        #del output_dict
+        torch.cuda.empty_cache()
+        gc.collect()
+        '''
         if return_dict:
             return output_dict
         else:
@@ -239,7 +248,8 @@ class STGSDiffModel(PreTrainedModel):
         output_normal_logits: Optional[bool] = False,
         output_stgs_logits: Optional[bool] = False,
         num_beams: int = 1,
-        use_bpttoken: bool = False,
+        use_bpttoken: bool = True,
+        use_diff_tokens: bool = False,
         **kwargs
     ) -> Tensor:
         """
@@ -265,8 +275,8 @@ class STGSDiffModel(PreTrainedModel):
             
         # Save original mode and set to eval if not using BPTT
         original_mode = self.training
-        if not use_bpttoken:
-            self.eval()
+        #if not use_bpttoken:
+        #    self.eval()
         
         # Override temperature if provided
         original_temp = self.stgs.init_temperature
@@ -284,11 +294,12 @@ class STGSDiffModel(PreTrainedModel):
             batch_size = input_one_hots.size(0)
             input_len = input_one_hots.size(1)
         
-        if attention_mask is None:
-            if input_ids is not None:
-                attention_mask = (input_ids != self.pad_token_id).long()
-            elif input_one_hots is not None:
-                attention_mask = (input_one_hots.sum(-1) != 0).long()
+        with torch.no_grad():
+            if attention_mask is None:
+                if input_ids is not None:
+                    attention_mask = (input_ids != self.pad_token_id).long()
+                elif input_one_hots is not None:
+                    attention_mask = (input_one_hots.sum(-1) != 0).long()
         
         # Get embedding layer
         embedding_layer = self.model.get_input_embeddings()
@@ -297,7 +308,7 @@ class STGSDiffModel(PreTrainedModel):
         if input_ids is not None:
             inputs_embeds = embedding_layer(input_ids)
         elif input_one_hots is not None:
-            inputs_embeds = torch.matmul(input_one_hots, embedding_layer.weight.unsqueeze(0))
+            inputs_embeds = torch.matmul(input_one_hots, embedding_layer.weight.unsqueeze(0).detach())
         
         # Prepare output
         '''
@@ -331,33 +342,51 @@ class STGSDiffModel(PreTrainedModel):
             use_cache=True,
             return_dict=True,
         ))
+        #import ipdb; ipdb.set_trace()
         outputs = self.forward(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask.detach(),
             **kwargs,
         )
         
-        next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
-        next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
+        if not use_diff_tokens:
+            next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
+            next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
+        else:
+            next_token_logits = None
+
         next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
         if next_token_logits is not None:
             next_token_id = next_token_logits.argmax(-1)
             next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
-        next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
+        if not use_diff_tokens:
+            next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
         input_logits = outputs.input_logits
 
-        for ok, ov in outputs.items():
-            if ok not in all_dict \
-            or ov is None:  continue
-            if len(ov.shape) >= 2 \
-            and ok != 'input_logits':
-                ov = ov[:,-1:]
-            all_dict[ok].append(ov)
-        all_one_hot.append(next_token_stgs_one_hot)            
+        if not use_diff_tokens:
+            for ok, ov in outputs.items():
+                if ok not in all_dict \
+                or ov is None:  continue
+                if len(ov.shape) >= 2 \
+                and ok != 'input_logits':
+                    ov = ov[:,-1:]
+                all_dict[ok].append(ov)
+            all_one_hot.append(next_token_stgs_one_hot)            
+        past_key_values = outputs.past_key_values
+
+        ##
+        #VRAM BOOKKEEPING
+        del outputs
+        torch.cuda.empty_cache()
+        gc.collect()
+        ##
 
         # Get embeddings for the next token
         if self.stgs_logits_generation:
-            next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
+            if use_diff_tokens:
+                next_token_embedding = embedding_layer(next_token_stgs_id.long())
+            else:
+                next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0).detach())
         else:
             next_token_logits_distr = torch.softmax(next_token_logits, dim=-1)
             next_token_embedding = torch.matmul(next_token_logits_distr, embedding_layer.weight.unsqueeze(0))
@@ -366,10 +395,11 @@ class STGSDiffModel(PreTrainedModel):
         if not use_bpttoken:
             next_token_embedding = next_token_embedding.detach()
         
-        attention_mask = torch.cat([
-            attention_mask,
-            torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
-        ], dim=-1)
+        with torch.no_grad():
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
+            ], dim=-1)
         # batch_size x seq_len+1
 
         # Generation loop with BPTT
@@ -381,21 +411,23 @@ class STGSDiffModel(PreTrainedModel):
         if max_length is not None:
             max_new_tokens = max_length - input_len +1
         assert max_new_tokens is not None
-        for it in range(1, max_new_tokens):
+        for it in tqdm(range(1, max_new_tokens)):
             # Forward pass with past key values for efficient generation
             #torch.cuda.empty_cache()
             #gc.collect()
             
             outputs = self.forward(
                 inputs_embeds=next_token_embedding,
-                attention_mask=attention_mask,
-                past_key_values=outputs.past_key_values,
+                attention_mask=attention_mask.detach(),
+                past_key_values=past_key_values,
                 **kwargs
             )
-            
+            past_key_values = outputs.past_key_values
+
             # Get elements for ONLY THE NEXT TOKEN:
-            next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
-            next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
+            if not use_diff_tokens:
+                next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
+                next_token_stgs_logits = outputs.stgs_logits[:,-1:] if output_stgs_logits else None
             next_token_stgs_id = outputs.sampled_diff_tokens[:,-1:] if output_diff_tokens else None
             if next_token_logits is not None:
                 next_token_id = next_token_logits.argmax(-1)
@@ -403,21 +435,25 @@ class STGSDiffModel(PreTrainedModel):
             else:
                 assert self.stgs_logits_generation
             
-            next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
+            if not use_diff_tokens:
+                next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
 
-            for ok, ov in outputs.items():
-                if ok not in all_dict \
-                or ov is None:  continue
-                if len(ov.shape) >= 2 \
-                and ok != 'input_logits':
-                    ov = ov[:,-1:]
-                all_dict[ok].append(ov)
-            all_one_hot.append(next_token_stgs_one_hot)
+                for ok, ov in outputs.items():
+                    if ok not in all_dict \
+                    or ov is None:  continue
+                    if len(ov.shape) >= 2 \
+                    and ok != 'input_logits':
+                        ov = ov[:,-1:]
+                    all_dict[ok].append(ov)
+                all_one_hot.append(next_token_stgs_one_hot)
 
             # Get embeddings for the next token
             #next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
             if self.stgs_logits_generation:
-                next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
+                if use_diff_tokens:
+                    next_token_embedding = embedding_layer(next_token_stgs_id.long())
+                else:
+                    next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0).detach())
             else:
                 next_token_logits_distr = torch.softmax(next_token_logits, dim=-1)
                 next_token_embedding = torch.matmul(next_token_logits_distr, embedding_layer.weight.unsqueeze(0))
@@ -426,19 +462,29 @@ class STGSDiffModel(PreTrainedModel):
             if not use_bpttoken:
                 next_token_embedding = next_token_embedding.detach()
             
-            attention_mask = torch.cat([
-                attention_mask,
-                torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
-            ], dim=-1)
+            #import ipdb; ipdb.set_trace()
+            with torch.no_grad():
+                attention_mask = torch.cat([
+                    attention_mask,
+                    torch.ones((batch_size, 1), device=self.device, dtype=torch.long)
+                ], dim=-1)
             # batch_size x seq_len+it+1
         
-        all_one_hot = torch.cat(all_one_hot, dim=1)
+        if not use_diff_tokens:
+            all_one_hot = torch.cat(all_one_hot, dim=1)
         # batch_size x max_length x vocab_size
         
         # Restore original mode and temperature
         self.train(original_mode)
         self.stgs.init_temperature = original_temp
         
+        ##
+        #VRAM BOOKKEEPING
+        del outputs
+        torch.cuda.empty_cache()
+        gc.collect()
+        ##
+
         if return_dict:
             output_dict: STGSOutput = STGSOutput(
                 input_logits=input_logits, #all_dict['input_logits'][-1],
