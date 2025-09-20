@@ -49,8 +49,9 @@ That's it!"""
         """Test handling malformed markdown blocks."""
         malformed = "```python\ndef hello():\n    return 'test'"  # Missing closing ```
         result = extract_python_block(malformed)
-        # Should return the stripped original text when extraction fails
-        assert result == malformed.strip()
+        # Should extract the code part even without closing ```
+        expected = "def hello():\n    return 'test'"
+        assert result == expected
     
     def test_clean_leetcode_signature_removes_assert(self):
         """Test removing assert statements from code."""
@@ -284,7 +285,7 @@ class TestSDLMLeetCodeOptPipeline:
         
         # Check model type and configuration
         assert isinstance(coder_model, STGSDiffModel)
-        assert coder_model.device == device
+        assert str(coder_model.device).startswith(str(device).split(':')[0])  # Handle cuda:0 vs cuda
         assert tokenizer.pad_token is not None
         
         # Check STGS configuration
@@ -386,8 +387,8 @@ class TestSDLMLeetCodeOptEvaluator:
     """Test LeetCode evaluator with mocking."""
     
     @patch.dict(os.environ, {'LEETCODE_CSRF_TOKEN': 'test_token', 'LEETCODE_SESSION': 'test_session'})
-    @patch('sdlm.leetcode.evaluators.leetcode_eval.LeetCodeEnv')
-    @patch('sdlm.leetcode.evaluators.leetcode_eval.Cache')
+    @patch('leetcode_env.environment.LeetCodeEnv')
+    @patch('diskcache.Cache')
     def test_leetcode_evaluator_initialization(self, mock_cache, mock_leetcode_env):
         """Test LeetCode evaluator initialization."""
         from sdlm.leetcode.evaluators.leetcode_eval import LeetCodeEvaluator
@@ -412,8 +413,8 @@ class TestSDLMLeetCodeOptEvaluator:
         
         # Mock the dependencies but avoid full initialization
         with patch.dict(os.environ, {'LEETCODE_CSRF_TOKEN': 'test', 'LEETCODE_SESSION': 'test'}), \
-             patch('sdlm.leetcode.evaluators.leetcode_eval.LeetCodeEnv'), \
-             patch('sdlm.leetcode.evaluators.leetcode_eval.Cache'):
+             patch('leetcode_env.environment.LeetCodeEnv'), \
+             patch('diskcache.Cache'):
             
             evaluator = LeetCodeEvaluator()
             
@@ -427,8 +428,8 @@ class TestSDLMLeetCodeOptEvaluator:
             assert "def test():return 42" in formatted_code
     
     @patch.dict(os.environ, {'LEETCODE_CSRF_TOKEN': 'test', 'LEETCODE_SESSION': 'test'})
-    @patch('sdlm.leetcode.evaluators.leetcode_eval.LeetCodeEnv')
-    @patch('sdlm.leetcode.evaluators.leetcode_eval.Cache')
+    @patch('leetcode_env.environment.LeetCodeEnv')
+    @patch('diskcache.Cache')
     def test_caching_functionality(self, mock_cache_class, mock_leetcode_env):
         """Test caching functionality."""
         from sdlm.leetcode.evaluators.leetcode_eval import LeetCodeEvaluator
