@@ -110,12 +110,13 @@ class STGS(nn.Module):
 
         # Straight-through: use hard in forward, soft in backward
         if self.stgs_hard:
-            y_hard = F.one_hot(output_ids, num_classes=self.vocab_size)
-            # batch_size x seq_len x vocab_size
-            # Type: half or full
-            y_hard = y_hard.to(x.dtype)
-            # Straight-through trick: y_hard - y_soft.detach() + y_soft
-            output_one_hot = y_hard - y_soft.detach() + y_soft
+            with torch.no_grad():
+                y_hard = F.one_hot(output_ids, num_classes=self.vocab_size)
+                # batch_size x seq_len x vocab_size
+                # Type: half or full
+                y_hard = y_hard.to(x.dtype)
+            # Straight-through trick: 
+            output_one_hot = y_hard.detach() - y_soft.detach() + y_soft
             # batch_size x seq_len x vocab_size
         else:
             output_one_hot = y_soft

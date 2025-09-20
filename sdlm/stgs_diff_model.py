@@ -97,6 +97,7 @@ class STGSDiffModel(PreTrainedModel):
         },
         stgs_logits_generation: Optional[bool] = True,
         device: Optional[str] = None,
+        strategy: Optional[str] = 'STGS', #or 'distributional'
     ):
         # Initialize with the config from the base model
         super().__init__(model.config)
@@ -132,6 +133,7 @@ class STGSDiffModel(PreTrainedModel):
         inputs_embeds: Optional[Tensor] = None,
         output_hidden_states: bool = True,
         output_diff_tokens: Optional[bool] = False,
+        output_diff_one_hots: Optional[bool] = False,
         output_normal_logits: Optional[bool] = False,
         output_stgs_logits: Optional[bool] = False,
         output_past_key_values: bool = True,
@@ -191,10 +193,18 @@ class STGSDiffModel(PreTrainedModel):
         hidden_states = outputs.hidden_states if hasattr(outputs, 'hidden_states') else None
         
         # Apply STGS sampling
-        diff_output_ids, diff_one_hot, temperature, stgs_logits = self.stgs(
-            logits,
-            hidden_states=hidden_states
-        )
+        if self.stgs_logits_generation:
+            diff_output_ids, diff_one_hot, temperature, stgs_logits = self.stgs(
+                logits,
+                hidden_states=hidden_states
+            )
+        else:
+            output_stgs_logits = False
+            output_diff_tokens = False
+            output_diff_one_hots = False
+            output_normal_logits = True
+            diff_output_ids, diff_one_hot = None, None
+            temperature, stgs_logits = None, None
         
         # Compute loss if labels are provided
         loss = None
@@ -212,7 +222,7 @@ class STGSDiffModel(PreTrainedModel):
             logits=logits if output_normal_logits else None,
             stgs_logits=stgs_logits if output_stgs_logits else None,
             sampled_diff_tokens=diff_output_ids if output_diff_tokens else None,
-            sampled_diff_one_hot=diff_one_hot,
+            sampled_diff_one_hot=diff_one_hot if output_diff_one_hots else None,
             temperature=temperature,
             loss=loss, 
         )
@@ -245,6 +255,7 @@ class STGSDiffModel(PreTrainedModel):
         temperature: Optional[float] = None,
         output_hidden_states: Optional[bool] = False,
         output_diff_tokens: Optional[bool] = False,
+        output_diff_one_hots: Optional[bool] = True,
         output_normal_logits: Optional[bool] = False,
         output_stgs_logits: Optional[bool] = False,
         num_beams: int = 1,
@@ -333,9 +344,17 @@ class STGSDiffModel(PreTrainedModel):
         all_one_hot = []
         
         # Initial forward pass
+        if not self.stgs_logits_generation:
+            output_hidden_states=output_hidden_states and self.stgs_logits_generation
+            output_diff_tokens=output_diff_tokens and self.stgs_logits_generation
+            output_diff_one_hots=output_diff_one_hots and self.stgs_logits_generation
+            output_normal_logits=output_normal_logits or not(self.stgs_logits_generation)
+            output_stgs_logits=output_stgs_logits and self.stgs_logits_generation
+        
         kwargs.update(dict(
             output_hidden_states=output_hidden_states,
             output_diff_tokens=output_diff_tokens,
+            output_diff_one_hots=output_diff_one_hots,
             output_normal_logits=output_normal_logits,
             output_stgs_logits=output_stgs_logits,
             output_past_key_values=True,
@@ -360,7 +379,7 @@ class STGSDiffModel(PreTrainedModel):
             next_token_id = next_token_logits.argmax(-1)
             next_token_one_hot = F.one_hot(next_token_id, num_classes=self.model.config.vocab_size)
         if not use_diff_tokens:
-            next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
+            next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:] if output_diff_one_hots else None
         input_logits = outputs.input_logits
 
         if not use_diff_tokens:
@@ -371,7 +390,10 @@ class STGSDiffModel(PreTrainedModel):
                 and ok != 'input_logits':
                     ov = ov[:,-1:]
                 all_dict[ok].append(ov)
-            all_one_hot.append(next_token_stgs_one_hot)            
+            if self.stgs_logits_generation:
+                all_one_hot.append(next_token_stgs_one_hot)
+            else:
+                all_one_hot.append(next_token_logits)
         past_key_values = outputs.past_key_values
 
         ##
@@ -423,7 +445,7 @@ class STGSDiffModel(PreTrainedModel):
                 **kwargs
             )
             past_key_values = outputs.past_key_values
-
+            
             # Get elements for ONLY THE NEXT TOKEN:
             if not use_diff_tokens:
                 next_token_logits = outputs.logits[:,-1:] if output_normal_logits else None
@@ -436,7 +458,7 @@ class STGSDiffModel(PreTrainedModel):
                 assert self.stgs_logits_generation
             
             if not use_diff_tokens:
-                next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:]
+                next_token_stgs_one_hot = outputs.sampled_diff_one_hot[:,-1:] if output_diff_one_hots else None
 
                 for ok, ov in outputs.items():
                     if ok not in all_dict \
@@ -445,7 +467,10 @@ class STGSDiffModel(PreTrainedModel):
                     and ok != 'input_logits':
                         ov = ov[:,-1:]
                     all_dict[ok].append(ov)
-                all_one_hot.append(next_token_stgs_one_hot)
+                if self.stgs_logits_generation:
+                    all_one_hot.append(next_token_stgs_one_hot)
+                else:
+                    all_one_hot.append(next_token_logits)
 
             # Get embeddings for the next token
             #next_token_embedding = torch.matmul(all_one_hot[-1], embedding_layer.weight.unsqueeze(0))
@@ -462,7 +487,6 @@ class STGSDiffModel(PreTrainedModel):
             if not use_bpttoken:
                 next_token_embedding = next_token_embedding.detach()
             
-            #import ipdb; ipdb.set_trace()
             with torch.no_grad():
                 attention_mask = torch.cat([
                     attention_mask,
@@ -494,8 +518,10 @@ class STGSDiffModel(PreTrainedModel):
                 if output_stgs_logits else None,
                 sampled_diff_tokens=torch.cat(all_dict['sampled_diff_tokens'], dim=1) \
                 if output_diff_tokens else None,
-                sampled_diff_one_hot=torch.cat(all_dict['sampled_diff_one_hot'], dim=1),
-                temperature=torch.stack(all_dict['temperature']),
+                sampled_diff_one_hot=torch.cat(all_dict['sampled_diff_one_hot'], dim=1) \
+                if output_diff_one_hots else None,
+                temperature=torch.stack(all_dict['temperature']) \
+                if self.stgs_logits_generation else None,
                 loss=torch.stack(all_dict['loss']) if len(all_dict['loss']) else None, 
             )
             #torch.cuda.empty_cache()
