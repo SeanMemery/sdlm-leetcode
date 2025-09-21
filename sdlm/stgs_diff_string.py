@@ -63,13 +63,16 @@ class STGSDiffString(nn.Module):
         
         # Initialize logits for the one-hot distribution
         self.init_strategy = init_strategy
-        if self.init_strategy == "random":
+        if "random" in self.init_strategy:
             # Start with one-hot encoding of the input_ids
+            logits = self.logit_scaler*F.one_hot(self.input_ids, num_classes=self.vocab_size).float().to(device)
+            if "normalised" in self.init_strategy:
+                logits = (logits-logits.mean())/logits.std()
             self.logits = nn.Parameter(
-                self.logit_scaler*F.one_hot(self.input_ids, num_classes=self.vocab_size).float().to(device),
+                logits.detach(),
                 requires_grad=True,
             )
-        elif self.init_strategy == "fluency":
+        elif "fluency" in self.init_strategy:
             # Start with a logit distribution similar to the fluency model's next_token distribution:
             import sdlm
             fluency_model = sdlm._manager.get_fluency_model()
@@ -102,6 +105,8 @@ class STGSDiffString(nn.Module):
                 src=(1+logit_max)*torch.ones_like(logits),
             )
             assert all(logits.argmax(dim=-1) == self.input_ids[0])
+            if "unnormalised" not in self.init_strategy:
+                logits = (logits-logits.mean())/logits.std()
             self.logits = nn.Parameter(
                 logits.detach().to(self.device).unsqueeze(0), # adding the batch dim...
                 requires_grad=True,
