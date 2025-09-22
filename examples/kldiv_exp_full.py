@@ -355,19 +355,14 @@ class SingleRunExecutor:
         
         for item in self.items:
             # Initialize code
-            if self.config.init_strategy == "fluency":
-                init_text = item["starter_text"]
-            else:
-                init_text = self.utils.random_string_like_length(
-                    self.tokenizer, length_tokens=item["length"]
-                )
+            init_text = item["starter_text"] + " " * (self.config.max_len_tokens - len(item["starter_text"]))
             
             # Create variable
             var = Variable(
                 tokenizer=self.tokenizer,
                 initial_str=init_text,
                 template="{VARIABLE}",
-                use_fluency_constraint=False,
+                use_fluency_constraint=self.config.init_strategy == "fluency",
                 temperature=self.config.temperature,
                 hard=False,
                 learnable_temperature=False,
@@ -660,8 +655,6 @@ class ExperimentRunner:
             prefix = f"Problem:\n{desc}\n\nCode:\n"
             
             starter_ids = tokenizer(starter, add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)[0]
-            if starter_ids.size(0) == 0:
-                starter_ids = tokenizer("def solution():\n    pass", add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)[0]
             if starter_ids.size(0) > self.config.max_len_tokens:
                 starter_ids = starter_ids[:self.config.max_len_tokens]
             starter_text = tokenizer.decode(starter_ids, skip_special_tokens=True)

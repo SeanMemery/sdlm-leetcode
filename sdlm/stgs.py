@@ -83,35 +83,49 @@ class STGS(nn.Module):
                 eff_temperature = eff_temperature.repeat(1, seq_len, 1)
         else:
             eff_temperature = torch.tensor([self.init_temperature], device=self.device)
+        eff_temperature = eff_temperature.to(
+            device=x.device,
+            dtype=x.dtype,
+        )
 
         # Gumbel-Softmax sampling
-        u = torch.rand_like(x)*(0.999-self.eps)+self.eps
-        gumbels = -torch.log( -torch.log(u))
+        with torch.no_grad():
+            u = torch.rand_like(x)*(0.999-self.eps)+self.eps
+            gumbels = -torch.log( -torch.log(u)).to(
+                device=x.device,
+                dtype=x.dtype,
+            )
         # batch_size x seq_len x vocab_size
 
-        logits = (x + gumbels)
+        logits = (x + gumbels).float()
         y_soft = F.softmax(logits / eff_temperature, dim=-1)
+        # temperary float conversion to prevent from underflow and breaking Simplex assumption
         # batch_size x seq_len x vocab_size
 
         # Sampling from batched distribution y_soft:
         output_ids = torch.distributions.Categorical(probs=y_soft).sample()
         # batch_size x seq_len
+        del logits
+        y_soft = y_soft.to(x.dtype)
 
         # Straight-through: use hard in forward, soft in backward
         if self.stgs_hard:
-            y_hard = F.one_hot(output_ids, num_classes=self.vocab_size)
-            # batch_size x seq_len x vocab_size
-            # Type: half or full
-            y_hard = y_hard.half() if x.dtype == torch.half else y_hard.float()
-            # Straight-through trick: y_hard - y_soft.detach() + y_soft
-            output_one_hot = y_hard - y_soft.detach() + y_soft
+            with torch.no_grad():
+                y_hard = F.one_hot(output_ids, num_classes=self.vocab_size)
+                # batch_size x seq_len x vocab_size
+                # Type: half or full
+                y_hard = y_hard.to(x.dtype)
+            # Straight-through trick: 
+            output_one_hot = y_hard.detach() - y_soft.detach() + y_soft
             # batch_size x seq_len x vocab_size
         else:
             output_one_hot = y_soft
             # batch_size x seq_len x vocab_size
 
-        # Type: half or full
-        output_one_hot = output_one_hot.half() if x.dtype == torch.half else output_one_hot.float()
+        output_one_hot = output_one_hot.to(
+            device=x.device,
+            dtype=x.dtype,
+        )
 
         # Differentiable output ids:
         gathered_one_hot = torch.gather(output_one_hot, dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)

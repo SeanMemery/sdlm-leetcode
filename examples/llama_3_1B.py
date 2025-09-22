@@ -30,7 +30,7 @@ def main():
         "--max_items", "15",
         "--split", "train",
         "--difficulty", "Easy",
-        "--max_len_tokens", "256",  # Reduced for 1B model
+        "--max_len_tokens", "1024",  # Reduced for 1B model
         
         # Training settings optimized for 1B model
         "--inits", "fluency", "random",
