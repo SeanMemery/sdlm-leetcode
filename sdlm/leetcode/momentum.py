@@ -144,7 +144,24 @@ class MomentumLossFunction:
             return torch.zeros((), device=device, dtype=W.dtype).sum()
 
         attn = torch.ones(inputs_embeds.shape[:-1], dtype=torch.long, device=device)
-        outputs = model(inputs_embeds=inputs_embeds, attention_mask=attn, return_dict=True)
+        
+        # Handle STGSDiffModel vs base model differences
+        try:
+            outputs = model(inputs_embeds=inputs_embeds, attention_mask=attn, return_dict=True, output_normal_logits=True)
+        except Exception as e:
+            # Try with the base model if STGSDiffModel fails
+            if hasattr(model, 'model'):
+                outputs = model.model(inputs_embeds=inputs_embeds, attention_mask=attn, return_dict=True)
+            else:
+                raise e
+        
+        # Check if outputs has logits attribute
+        if outputs is None:
+            raise ValueError("Model returned None output")
+        
+        if not hasattr(outputs, 'logits') or outputs.logits is None:
+            raise ValueError(f"Model output missing logits. Output type: {type(outputs)}")
+        
         next_logits = outputs.logits[:, -1, :]  # (1, V)
         return self._loss_from_next_token_logits(next_logits, target_id)
     
@@ -198,12 +215,46 @@ class MomentumLossFunction:
         answer_prompt = reasoning_text + f"\n\nBased on the above reasoning, the answer is "
         
         answer_inputs = self.tokenizer(answer_prompt, return_tensors="pt").to(device)
-        answer_outputs = model(
-            input_ids=answer_inputs["input_ids"],
-            attention_mask=answer_inputs.get("attention_mask"),
-            return_dict=True
-        )
-        next_logits = answer_outputs.logits[:, -1, :]  # (1, V)
+        
+        # Handle STGSDiffModel vs base model differences
+        try:
+            answer_outputs = model(
+                input_ids=answer_inputs["input_ids"],
+                attention_mask=answer_inputs.get("attention_mask"),
+                return_dict=True,
+                output_normal_logits=True
+            )
+        except Exception as e:
+            # Try with the base model if STGSDiffModel fails
+            if hasattr(model, 'model'):
+                answer_outputs = model.model(
+                    input_ids=answer_inputs["input_ids"],
+                    attention_mask=answer_inputs.get("attention_mask"),
+                    return_dict=True
+                )
+            else:
+                raise e
+        
+        # Check if outputs has logits attribute
+        if answer_outputs is None:
+            raise ValueError("Model returned None output")
+        if not hasattr(answer_outputs, 'logits') or answer_outputs.logits is None:
+            # Try to get logits from different attribute names
+            if hasattr(answer_outputs, 'last_hidden_state'):
+                # If we only have hidden states, we need to project to vocab
+                hidden_states = answer_outputs.last_hidden_state
+                if hasattr(model, 'lm_head'):
+                    logits = model.lm_head(hidden_states)
+                elif hasattr(model, 'model') and hasattr(model.model, 'lm_head'):
+                    logits = model.model.lm_head(hidden_states)
+                else:
+                    raise ValueError("Cannot find lm_head to compute logits from hidden states")
+                next_logits = logits[:, -1, :]  # (1, V)
+            else:
+                raise ValueError(f"Model output has no logits attribute. Available attributes: {dir(answer_outputs)}")
+        else:
+            next_logits = answer_outputs.logits[:, -1, :]  # (1, V)
+            
         return self._loss_from_next_token_logits(next_logits, target_id)
     
     def _loss_from_next_token_logits(self, next_logits: torch.Tensor, target_id: int) -> torch.Tensor:
@@ -250,12 +301,52 @@ class MomentumLossFunction:
             max_length=2048
         ).to(device)
 
-        outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask"),
-            return_dict=True
-        )
-        next_logits = outputs.logits[:, -1, :]  # (1, V)
+        # Handle STGSDiffModel vs base model differences
+        try:
+            outputs = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask"),
+                return_dict=True,
+                output_normal_logits=True
+            )
+        except Exception as e:
+            # Try with the base model if STGSDiffModel fails
+            if hasattr(model, 'model'):
+                outputs = model.model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    return_dict=True
+                )
+            else:
+                raise e
+        
+        # Check if outputs has logits attribute
+        if outputs is None:
+            raise ValueError("Model returned None output")
+        
+        # Try to access logits in different ways
+        logits_tensor = None
+        if hasattr(outputs, 'logits') and outputs.logits is not None:
+            logits_tensor = outputs.logits
+        elif 'logits' in outputs and outputs['logits'] is not None:
+            logits_tensor = outputs['logits']
+        elif hasattr(outputs, 'last_hidden_state'):
+            # If we only have hidden states, we need to project to vocab
+            hidden_states = outputs.last_hidden_state
+            if hasattr(model, 'lm_head'):
+                logits_tensor = model.lm_head(hidden_states)
+            elif hasattr(model, 'model') and hasattr(model.model, 'lm_head'):
+                logits_tensor = model.model.lm_head(hidden_states)
+            else:
+                raise ValueError("Cannot find lm_head to compute logits from hidden states")
+        else:
+            raise ValueError(f"Model output has no logits attribute. Available attributes: {dir(outputs)}")
+        
+        if logits_tensor is None:
+            raise ValueError("Failed to extract logits from model output")
+            
+        next_logits = logits_tensor[:, -1, :]  # (1, V)
+            
         return self._loss_from_next_token_logits(next_logits, target_id)
     
     def _forward_cot_strings(self, code_string: str, target_id: int) -> torch.Tensor:
@@ -305,12 +396,46 @@ class MomentumLossFunction:
         answer_prompt = reasoning_text + f"\n\nBased on the above reasoning, the answer is "
         
         answer_inputs = tok(answer_prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
-        answer_outputs = model(
-            input_ids=answer_inputs["input_ids"],
-            attention_mask=answer_inputs.get("attention_mask"),
-            return_dict=True
-        )
-        next_logits = answer_outputs.logits[:, -1, :]  # (1, V)
+        
+        # Handle STGSDiffModel vs base model differences
+        try:
+            answer_outputs = model(
+                input_ids=answer_inputs["input_ids"],
+                attention_mask=answer_inputs.get("attention_mask"),
+                return_dict=True,
+                output_normal_logits=True
+            )
+        except Exception as e:
+            # Try with the base model if STGSDiffModel fails
+            if hasattr(model, 'model'):
+                answer_outputs = model.model(
+                    input_ids=answer_inputs["input_ids"],
+                    attention_mask=answer_inputs.get("attention_mask"),
+                    return_dict=True
+                )
+            else:
+                raise e
+        
+        # Check if outputs has logits attribute
+        if answer_outputs is None:
+            raise ValueError("Model returned None output")
+        if not hasattr(answer_outputs, 'logits') or answer_outputs.logits is None:
+            # Try to get logits from different attribute names
+            if hasattr(answer_outputs, 'last_hidden_state'):
+                # If we only have hidden states, we need to project to vocab
+                hidden_states = answer_outputs.last_hidden_state
+                if hasattr(model, 'lm_head'):
+                    logits = model.lm_head(hidden_states)
+                elif hasattr(model, 'model') and hasattr(model.model, 'lm_head'):
+                    logits = model.model.lm_head(hidden_states)
+                else:
+                    raise ValueError("Cannot find lm_head to compute logits from hidden states")
+                next_logits = logits[:, -1, :]  # (1, V)
+            else:
+                raise ValueError(f"Model output has no logits attribute. Available attributes: {dir(answer_outputs)}")
+        else:
+            next_logits = answer_outputs.logits[:, -1, :]  # (1, V)
+            
         return self._loss_from_next_token_logits(next_logits, target_id)
 
     def __call__(
@@ -327,3 +452,118 @@ class MomentumLossFunction:
             # Do not backpropagate through this path (typically called under torch.no_grad()).
             return self._forward_strings(batched_input)
         raise ValueError("Provide either batched_one_hot (preferred for training) or batched_input (for eval).")
+
+
+class PythonSyntaxMomentumLoss:
+    """
+    A momentum loss that validates Python syntax.
+    
+    This loss function asks "Is this valid Python code?" and returns a loss
+    based on whether the generated code has valid Python syntax.
+    """
+    
+    def __init__(self, critic_dlm):
+        self.critic_dlm = critic_dlm
+        
+        # Create the momentum question for syntax validation
+        self.momentum_question = "Is the following Python code syntactically correct?\n\n{input}\n\nAnswer:"
+        self.momentum_variables = {}
+        self.momentum_answer = "Yes"
+        
+        # Create an underlying MomentumLossFunction for the syntax question
+        self.syntax_momentum = MomentumLossFunction(
+            critic_dlm=critic_dlm,
+            momentum_question=self.momentum_question,
+            Momentum_variables=self.momentum_variables,
+            momentum_answer=self.momentum_answer,
+            use_cot=False
+        )
+    
+    @property
+    def device(self):
+        return self.critic_dlm.device
+    
+    @property
+    def tokenizer(self):
+        return self.critic_dlm.tokenizer
+    
+    def __call__(
+        self,
+        batched_one_hot: Optional[Sequence[torch.Tensor]] = None,
+        batched_input: Optional[List[str]] = None,
+    ) -> torch.Tensor:
+        """
+        Compute syntax validation loss.
+        
+        Args:
+            batched_one_hot: List of tensors (1, Lc, V) for differentiable training
+            batched_input: List of code strings for evaluation
+            
+        Returns:
+            Weighted syntax validation loss tensor
+        """
+        # Use the underlying momentum loss function
+        syntax_loss = self.syntax_momentum(
+            batched_one_hot=batched_one_hot,
+            batched_input=batched_input
+        )
+        
+        return syntax_loss
+
+
+class LeetCodeMomentumLoss:
+    """
+    A momentum loss for LeetCode problem solving.
+    
+    This loss function asks whether the generated code solves the given LeetCode problem.
+    It's a cleaner, class-based version of the original MomentumLossFunction.
+    """
+    
+    def __init__(self, critic_dlm, problem_description: str):
+        self.critic_dlm = critic_dlm
+        self.problem_description = problem_description
+        
+        # Create the momentum question for problem solving
+        self.momentum_question = "Does the following Python code correctly solve this problem?\n\nProblem: {t_descr}\n\nCode:\n{input}\n\nAnswer:"
+        self.momentum_variables = {"t_descr": problem_description}
+        self.momentum_answer = "Yes"
+        
+        # Create an underlying MomentumLossFunction for the problem-solving question
+        self.leetcode_momentum = MomentumLossFunction(
+            critic_dlm=critic_dlm,
+            momentum_question=self.momentum_question,
+            Momentum_variables=self.momentum_variables,
+            momentum_answer=self.momentum_answer,
+            use_cot=False
+        )
+    
+    @property
+    def device(self):
+        return self.critic_dlm.device
+    
+    @property
+    def tokenizer(self):
+        return self.critic_dlm.tokenizer
+    
+    def __call__(
+        self,
+        batched_one_hot: Optional[Sequence[torch.Tensor]] = None,
+        batched_input: Optional[List[str]] = None,
+    ) -> torch.Tensor:
+        """
+        Compute LeetCode problem-solving loss.
+        
+        Args:
+            batched_one_hot: List of tensors (1, Lc, V) for differentiable training
+            batched_input: List of code strings for evaluation
+            
+        Returns:
+            LeetCode problem-solving loss tensor
+        """
+        # Use the underlying momentum loss function
+        leetcode_loss = self.leetcode_momentum(
+            batched_one_hot=batched_one_hot,
+            batched_input=batched_input
+        )
+        
+        return leetcode_loss

@@ -35,8 +35,11 @@ except ImportError:
 
 from sdlm.leetcode.dataset import load_leetcode_dataset
 from sdlm.leetcode.utils import build_model, clean_for_submission
-from sdlm.leetcode.momentum import MomentumLossFunction
+from sdlm.leetcode.momentum import PythonSyntaxMomentumLoss, LeetCodeMomentumLoss
 from sdlm.textgrad.variables import Variable
+
+# Import SDLM to configure defaults
+import sdlm
 
 
 # ================================ Configuration ================================ #
@@ -81,6 +84,10 @@ class ExperimentConfig:
     wandb_tags: Optional[List[str]] = None
     wandb_notes: Optional[str] = None
     disable_wandb: bool = False
+    
+    # Temperature settings by initialization strategy
+    fluency_temperatures: Optional[List[float]] = None  # If None, uses default temperatures
+    random_temperatures: Optional[List[float]] = None   # If None, uses default temperatures
 
 
 @dataclass
@@ -164,17 +171,6 @@ class Utils:
         q_from = q_from.clamp_min(eps)
         q_to = q_to.clamp_min(eps)
         return (q_from * (q_from.log() - q_to.log())).sum(dim=-1).sum()
-    
-    @staticmethod
-    def random_string_like_length(tokenizer, length_tokens: int) -> str:
-        """Generate random string of specified token length."""
-        V = tokenizer.vocab_size
-        ids = torch.randint(low=0, high=V, size=(1, length_tokens))
-        text = tokenizer.decode(ids[0], skip_special_tokens=True)
-        if not text.strip():
-            text = "x" * max(1, length_tokens)
-        return text
-
 
 # ================================ Wandb Integration ================================ #
 
@@ -230,21 +226,23 @@ class WandbLogger:
             return
         
         wandb_metrics = {
-            "train/momentum_loss": metrics["momentum_loss_mean"],
-            "train/kl_C0_Ct": metrics["kl_C0_Ct_mean"],
-            "train/kl_Ctm1_Ct": metrics["kl_Ctm1_Ct_mean"],
-            "train/temperature": metrics["temperature"],
-            "performance/step_duration_sec": metrics["step_duration_sec"],
-            "performance/elapsed_time_min": metrics["elapsed_time_sec"] / 60,
+            "train/leetcode_momentum": metrics["loss/leetcode_momentum"],
+            "train/python_syntax": metrics["loss/python_syntax"],
+            "train/total_combined": metrics["loss/total_combined"],
+            "train/kl_C0_to_Ct": metrics["kl/C0_to_Ct"],
+            "train/kl_Ct_minus_1_to_Ct": metrics["kl/Ct_minus_1_to_Ct"],
+            "train/temperature": metrics["optimization/temperature"],
+            "performance/step_duration_sec": metrics["timing/step_duration_sec"],
+            "performance/elapsed_time_min": metrics["timing/elapsed_time_sec"] / 60,
         }
         
-        if not math.isnan(metrics.get("lm_entropy_mean", float("nan"))):
-            wandb_metrics["train/lm_entropy"] = metrics["lm_entropy_mean"]
+        if not math.isnan(metrics.get("poe/lm_entropy", float("nan"))):
+            wandb_metrics["train/poe_lm_entropy"] = metrics["poe/lm_entropy"]
         
         # Log text sample occasionally
-        if step % 100 == 0 and metrics.get("decoded_sample0", "").strip():
+        if step % 100 == 0 and metrics.get("samples/generated_code", "").strip():
             wandb_metrics["samples/decoded_text"] = wandb.Html(
-                f"<pre>{metrics['decoded_sample0'][:500]}</pre>"
+                f"<pre>{metrics['samples/generated_code'][:500]}</pre>"
             )
         
         wandb.log(wandb_metrics, step=step)
@@ -308,7 +306,23 @@ class ProductOfExperts:
                 else:
                     ctx_ids = torch.cat([pre_ids, code_ids[:t].unsqueeze(0)], dim=1)
                 attn = torch.ones_like(ctx_ids)
-                out = model(input_ids=ctx_ids, attention_mask=attn, return_dict=True)
+                # Handle STGSDiffModel vs base model differences
+                try:
+                    out = model(input_ids=ctx_ids, attention_mask=attn, return_dict=True, output_normal_logits=True)
+                except Exception as e:
+                    # Try with the base model if STGSDiffModel fails
+                    if hasattr(model, 'model'):
+                        out = model.model(input_ids=ctx_ids, attention_mask=attn, return_dict=True)
+                    else:
+                        raise e
+                
+                # Check if outputs has logits attribute
+                if out is None:
+                    raise ValueError("Model returned None output")
+                
+                if not hasattr(out, 'logits') or out.logits is None:
+                    raise ValueError(f"Model output missing logits. Output type: {type(out)}")
+                
                 logp = out.logits[:, -1, :].log_softmax(dim=-1).squeeze(0)
                 p_list.append(logp.exp())
             
@@ -321,6 +335,16 @@ class ProductOfExperts:
         """Apply Product-of-Experts: q_poe ∝ q * (p_lm^gamma)."""
         if gamma <= 0:
             return q
+        
+        # Ensure q and p_lm have compatible sequence lengths
+        q_len = q.size(1)  # (1, L_q, V)
+        p_len = p_lm.size(0)  # (L_p, V)
+        
+        if q_len != p_len:
+            # Truncate to the shorter length to avoid dimension mismatch
+            min_len = min(q_len, p_len)
+            q = q[:, :min_len, :]  # (1, min_len, V)
+            p_lm = p_lm[:min_len, :]  # (min_len, V)
         
         p = p_lm.clamp_min(eps).unsqueeze(0)  # (1, L, V)
         mix = q * (p ** gamma)
@@ -343,7 +367,7 @@ class SingleRunExecutor:
         self.utils = Utils()
         self.poe = ProductOfExperts()
         
-    def setup_run(self, run_dir: Path) -> Tuple[List[Variable], List[MomentumLossFunction], WandbLogger]:
+    def setup_run(self, run_dir: Path) -> Tuple[List[Variable], List[LeetCodeMomentumLoss], List[PythonSyntaxMomentumLoss], WandbLogger]:
         """Set up variables, losses, and logging for the run."""
         # Initialize wandb logger
         logger = WandbLogger(self.config, use_wandb=not self.config.wandb_project is None)
@@ -352,12 +376,14 @@ class SingleRunExecutor:
         # Create variables and momentum losses
         variables = []
         momentum_losses = []
+        syntax_losses = []
         
         for item in self.items:
             # Initialize code
             init_text = item["starter_text"] + " " * (self.config.max_len_tokens - len(item["starter_text"]))
             
-            # Create variable
+            # Create variable - ensure tokenizer vocab size matches
+            print(f"Creating Variable with tokenizer vocab_size: {self.tokenizer.vocab_size}")
             var = Variable(
                 tokenizer=self.tokenizer,
                 initial_str=init_text,
@@ -372,18 +398,20 @@ class SingleRunExecutor:
                 var.train()
             variables.append(var)
             
-            # Create momentum loss
-            loss_fn = MomentumLossFunction(
+            # Create LeetCode momentum loss
+            loss_fn = LeetCodeMomentumLoss(
                 critic_dlm=self.model,
-                momentum_question=self.momentum_template,
-                Momentum_variables={"t_descr": item["desc"]},
-                momentum_answer="Yes",
-                use_cot=False,
-                answer_extractor="",
+                problem_description=item["desc"]
             )
             momentum_losses.append(loss_fn)
+            
+            # Create syntax validation loss
+            syntax_loss_fn = PythonSyntaxMomentumLoss(
+                critic_dlm=self.model
+            )
+            syntax_losses.append(syntax_loss_fn)
         
-        return variables, momentum_losses, logger
+        return variables, momentum_losses, syntax_losses, logger
     
     def initialize_kl_tracking(self, variables: List[Variable]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Initialize KL tracking tensors."""
@@ -403,9 +431,9 @@ class SingleRunExecutor:
         
         return q_init_list, q_prev_list
     
-    def training_step(self, step: int, variables: List[Variable], momentum_losses: List[MomentumLossFunction],
-                     q_init_list: List[torch.Tensor], q_prev_list: List[torch.Tensor],
-                     optimizer: torch.optim.Optimizer, start_time: float) -> Dict[str, Any]:
+    def training_step(self, step: int, variables: List[Variable], momentum_losses: List[LeetCodeMomentumLoss],
+                     syntax_losses: List[PythonSyntaxMomentumLoss], q_init_list: List[torch.Tensor], 
+                     q_prev_list: List[torch.Tensor], optimizer: torch.optim.Optimizer, start_time: float) -> Dict[str, Any]:
         """Execute a single training step."""
         step_start_time = time.time()
         optimizer.zero_grad()
@@ -419,12 +447,13 @@ class SingleRunExecutor:
         
         # Compute losses and KL divergences
         momentum_sum = 0.0
+        syntax_sum = 0.0
         kl_c0_ct_sum = 0.0
         kl_ctm1_ct_sum = 0.0
         ent_lm_sum = 0.0
         n_items = len(variables)
         
-        for idx, (var, item, loss_fn) in enumerate(zip(variables, self.items, momentum_losses)):
+        for idx, (var, item, loss_fn, syntax_fn) in enumerate(zip(variables, self.items, momentum_losses, syntax_losses)):
             # Get training distribution
             _, q_train, _ = var()
             
@@ -434,6 +463,9 @@ class SingleRunExecutor:
             # Compute momentum loss
             m_loss = loss_fn(batched_one_hot=[q_eff])
             
+            # Compute syntax loss
+            s_loss = syntax_fn(batched_one_hot=[q_eff])
+            
             # KL clipping
             scale = self._compute_kl_clip_scale(q_prev_list[idx], var, idx)
             
@@ -441,12 +473,15 @@ class SingleRunExecutor:
             kl_c0_ct, kl_ctm1_ct = self._monitor_kl_divergences(var, q_init_list[idx], q_prev_list, idx)
             
             momentum_sum += (scale * m_loss)
+            syntax_sum += (scale * s_loss)
             kl_c0_ct_sum += kl_c0_ct
             kl_ctm1_ct_sum += kl_ctm1_ct
         
-        # Backward pass
+        # Backward pass with combined loss
         momentum_mean = momentum_sum / max(1, n_items)
-        momentum_mean.backward()
+        syntax_mean = syntax_sum / max(1, n_items)
+        total_loss = momentum_mean + syntax_mean
+        total_loss.backward()
         
         if self.config.clip_norm and self.config.clip_norm > 0:
             all_params = []
@@ -468,14 +503,16 @@ class SingleRunExecutor:
         
         return {
             "step": step,
-            "momentum_loss_mean": float(momentum_mean.item()),
-            "kl_C0_Ct_mean": float(kl_c0_ct_sum.item() / max(1, n_items)),
-            "kl_Ctm1_Ct_mean": float(kl_ctm1_ct_sum.item() / max(1, n_items)),
-            "lm_entropy_mean": ent_lm_sum / max(1, n_items) if self.config.poe_gamma > 0 else float("nan"),
-            "temperature": float(T_now),
-            "decoded_sample0": text_sample,
-            "step_duration_sec": step_end_time - step_start_time,
-            "elapsed_time_sec": step_end_time - start_time,
+            "loss/leetcode_momentum": float(momentum_mean.item()),
+            "loss/python_syntax": float(syntax_mean.item()),
+            "loss/total_combined": float(total_loss.item()),
+            "kl/C0_to_Ct": float(kl_c0_ct_sum.item() / max(1, n_items)),
+            "kl/Ct_minus_1_to_Ct": float(kl_ctm1_ct_sum.item() / max(1, n_items)),
+            "poe/lm_entropy": ent_lm_sum / max(1, n_items) if self.config.poe_gamma > 0 else float("nan"),
+            "optimization/temperature": float(T_now),
+            "samples/generated_code": text_sample,
+            "timing/step_duration_sec": step_end_time - step_start_time,
+            "timing/elapsed_time_sec": step_end_time - start_time,
         }
     
     def generate_final_samples(self, variables: List[Variable], samples_dir: Path) -> List[str]:
@@ -584,9 +621,27 @@ class ExperimentRunner:
         self.config = config
         self.utils = Utils()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    def get_temperatures_for_init(self, init_strategy: str) -> List[float]:
+        """Get the appropriate temperatures for the given initialization strategy."""
+        if init_strategy == "fluency" and self.config.fluency_temperatures is not None:
+            return self.config.fluency_temperatures
+        elif init_strategy == "random" and self.config.random_temperatures is not None:
+            return self.config.random_temperatures
+        else:
+            # Fall back to default temperatures
+            return self.config.temperatures
         
     def setup_experiment(self) -> Tuple[Path, Any, Any, List[Dict], str]:
         """Set up the experiment environment."""
+        # Configure SDLM with the correct model FIRST
+        print(f"Configuring SDLM with model: {self.config.model}")
+        try:
+            sdlm.configure_default_model(self.config.model)
+            print(f"SDLM configured with model: {self.config.model}")
+        except Exception as e:
+            print(f"Warning: Could not configure SDLM: {e}")
+        
         # Create results directory
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         root_dir = self.utils.ensure_dir(Path(self.config.results_dir) / ts)
@@ -597,7 +652,11 @@ class ExperimentRunner:
             learnable_temperature=False, use_bpttoken=False, bpttoken=False,
             hidden_state_conditioning=False
         )
+        print(f"Building model: {self.config.model}")
         model, tokenizer = build_model(self.config.model, self.device, stgs_kwargs)
+        print(f"Model loaded successfully: {self.config.model}")
+        print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
+        
         
         # Load and prepare dataset
         dataset = load_leetcode_dataset(
@@ -625,14 +684,20 @@ class ExperimentRunner:
         root_dir, model, tokenizer, items, momentum_template = self.setup_experiment()
         summary_rows = []
         
-        total_runs = len(self.config.seeds) * len(self.config.init_strategies) * len(self.config.schedules) * len(self.config.temperatures)
+        # Calculate total runs considering different temperatures for different init strategies
+        total_runs = 0
+        for init_strategy in self.config.init_strategies:
+            temperatures = self.get_temperatures_for_init(init_strategy)
+            total_runs += len(self.config.seeds) * len(self.config.schedules) * len(temperatures)
         print(f"Running {total_runs} total experiments...")
         
         for seed in self.config.seeds:
             self.utils.set_seed(seed)
             for init_strategy in self.config.init_strategies:
+                # Get appropriate temperatures for this initialization strategy
+                temperatures = self.get_temperatures_for_init(init_strategy)
                 for schedule in self.config.schedules:
-                    for temperature in self.config.temperatures:
+                    for temperature in temperatures:
                         run_config = self._create_run_config(init_strategy, temperature, schedule, seed)
                         summary_row = self._execute_single_run(
                             run_config, root_dir, model, tokenizer, items, momentum_template
@@ -711,7 +776,7 @@ class ExperimentRunner:
         
         # Set up run
         executor = SingleRunExecutor(config, items, model, tokenizer, momentum_template)
-        variables, momentum_losses, logger = executor.setup_run(run_dir)
+        variables, momentum_losses, syntax_losses, logger = executor.setup_run(run_dir)
         q_init_list, q_prev_list = executor.initialize_kl_tracking(variables)
         
         # Set up optimizer
@@ -726,7 +791,7 @@ class ExperimentRunner:
         print(f"Starting training loop with {config.n_steps} steps...")
         for step in tqdm(range(config.n_steps), desc=desc):
             metrics = executor.training_step(
-                step, variables, momentum_losses, q_init_list, q_prev_list, optimizer, start_time
+                step, variables, momentum_losses, syntax_losses, q_init_list, q_prev_list, optimizer, start_time
             )
             
             # Log to wandb
@@ -756,7 +821,7 @@ class ExperimentRunner:
             "total_duration_min": total_duration / 60,
             "avg_step_duration_sec": total_duration / config.n_steps if config.n_steps > 0 else 0,
             "steps_completed": len(rows),
-            "final_temperature": rows[-1]["temperature"] if rows else float("nan"),
+            "final_temperature": rows[-1]["optimization/temperature"] if rows else float("nan"),
         }
         with open(run_dir / "training_stats.json", "w") as f:
             json.dump(training_stats, f, indent=2)
@@ -807,7 +872,9 @@ def create_parser() -> argparse.ArgumentParser:
     # Model and optimization arguments
     parser.add_argument("--model", type=str, default="gpt2", help="Model name")
     parser.add_argument("--inits", type=str, nargs="+", default=["fluency", "random"], choices=["fluency", "random"], help="Initialization strategies")
-    parser.add_argument("--temperatures", type=float, nargs="+", default=[0.7, 10.0, 100.0, 1000.0], help="Initial training temperatures")
+    parser.add_argument("--temperatures", type=float, nargs="+", default=[0.7, 10.0, 100.0, 1000.0], help="Default initial training temperatures")
+    parser.add_argument("--fluency_temperatures", type=float, nargs="+", default=None, help="Temperatures for fluency initialization (defaults to --temperatures)")
+    parser.add_argument("--random_temperatures", type=float, nargs="+", default=None, help="Temperatures for random initialization (defaults to --temperatures)")
     parser.add_argument("--schedules", type=str, nargs="+", default=["constant", "linear", "cosine", "exp_decay"], choices=["constant", "linear", "cosine", "exp_decay"], help="Temperature schedules")
     parser.add_argument("--t_final", type=float, default=0.7, help="Final temperature for schedules")
     parser.add_argument("--n_steps", type=int, default=10000, help="Number of training steps")
@@ -834,7 +901,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_tags", type=str, nargs="+", default=None, help="Wandb tags")
     parser.add_argument("--wandb_notes", type=str, default=None, help="Wandb run notes")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging")
-    
+
     return parser
 
 
@@ -852,6 +919,8 @@ def main():
         max_len_tokens=args.max_len_tokens,
         init_strategies=args.inits,
         temperatures=args.temperatures,
+        fluency_temperatures=args.fluency_temperatures,
+        random_temperatures=args.random_temperatures,
         schedules=args.schedules,
         t_final=args.t_final,
         n_steps=args.n_steps,
