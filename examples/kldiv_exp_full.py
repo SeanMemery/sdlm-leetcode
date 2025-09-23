@@ -17,6 +17,7 @@ from typing import List, Dict, Tuple, Optional, Any
 
 import torch
 import torch.nn.functional as F
+import torch.optim.lr_scheduler
 import pandas as pd
 from tqdm import tqdm
 
@@ -36,6 +37,7 @@ except ImportError:
 from sdlm.leetcode.dataset import load_leetcode_dataset
 from sdlm.leetcode.utils import build_model, clean_for_submission
 from sdlm.leetcode.momentum import PythonSyntaxMomentumLoss, LeetCodeMomentumLoss
+from sdlm.leetcode.utils import build_chat_prefix
 from sdlm.textgrad.variables import Variable
 
 # Import SDLM to configure defaults
@@ -62,6 +64,8 @@ class ExperimentConfig:
     t_final: float = 0.7
     n_steps: int = 10000
     lr: float = 5e-2
+    lr_scheduler: str = "cosine"  # cosine, linear, exponential, constant
+    lr_scheduler_kwargs: Dict[str, Any] = field(default_factory=dict)
     seeds: List[int] = field(default_factory=lambda: [42])
     hard_mode: bool = False
     
@@ -69,12 +73,14 @@ class ExperimentConfig:
     leetcode_loss_weight: float = 1.0
     syntax_loss_weight: float = 1.0
     
+    # Chain of thought configuration
+    use_cot: bool = False
+    
     # Monitoring configuration
     monitor_temperature: float = 0.7
     
-    # Product-of-Experts configuration
+    # Product-of-Experts configuration (online only)
     poe_gamma: float = 0.0
-    poe_every: int = 1
     
     # PPO-like clipping
     kl_clip: Optional[float] = None
@@ -113,12 +119,14 @@ class RunConfig:
     t_final: float
     n_steps: int
     lr: float
+    lr_scheduler: str
+    lr_scheduler_kwargs: Dict[str, Any]
     hard_mode: bool
     leetcode_loss_weight: float
     syntax_loss_weight: float
+    use_cot: bool
     monitor_temperature: float
     poe_gamma: float
-    poe_every: int
     kl_clip: Optional[float]
     device: str
     
@@ -292,71 +300,6 @@ class WandbLogger:
                 print(f"Warning: Failed to finish wandb run: {e}")
 
 
-# ================================ Product-of-Experts ================================ #
-
-class ProductOfExperts:
-    """Handles Product-of-Experts computations."""
-    
-    @staticmethod
-    def compute_lm_distributions(model, tokenizer, prefix: str, code_text: str, device: str) -> torch.Tensor:
-        """Compute per-position next-token distributions matching autoregressive generation."""
-        with torch.no_grad():
-            # Tokenize components
-            code_ids = tokenizer(code_text, add_special_tokens=False, return_tensors="pt").input_ids.to(device)[0]
-            prefix_ids = tokenizer(prefix, add_special_tokens=False, return_tensors="pt").input_ids.to(device)[0]
-            
-            # Concatenate prefix + code for full context
-            full_context = torch.cat([prefix_ids, code_ids], dim=0).unsqueeze(0)  # (1, seq_len)
-            attn_mask = torch.ones_like(full_context)
-            
-            # Get logits for entire sequence in one forward pass
-            out = model(input_ids=full_context, attention_mask=attn_mask, return_dict=True, output_normal_logits=True)
-            
-            # Check if outputs has logits attribute
-            if out is None:
-                raise ValueError("Model returned None output")
-            
-            if not hasattr(out, 'logits') or out.logits is None:
-                raise ValueError(f"Model output missing logits. Output type: {type(out)}")
-            
-            # Extract autoregressive logits for the code portion
-            # out.logits shape: (1, seq_len, vocab_size)
-            # Position i in logits predicts token i+1 in the sequence
-            # So logits[prefix_len-1:prefix_len+code_len-1] predict the code tokens
-            prefix_len = prefix_ids.size(0)
-            code_len = code_ids.size(0)
-            
-            # Get logits that predict each code token autoregressively
-            code_logits = out.logits[0, prefix_len-1:prefix_len + code_len - 1, :]  # (code_len, vocab_size)
-            
-            # Convert to probabilities
-            p_lm = code_logits.softmax(dim=-1)  # (code_len, vocab_size)
-            
-            # Ensure correct device and dtype
-            W = model.get_input_embeddings().weight
-            return p_lm.to(device=W.device, dtype=W.dtype)
-    
-    @staticmethod
-    def apply_poe(q: torch.Tensor, p_lm: torch.Tensor, gamma: float, eps: float = 1e-12) -> torch.Tensor:
-        """Apply Product-of-Experts: q_poe ∝ q * (p_lm^gamma)."""
-        if gamma <= 0:
-            return q
-        
-        # Ensure q and p_lm have compatible sequence lengths
-        q_len = q.size(1)  # (1, L_q, V)
-        p_len = p_lm.size(0)  # (L_p, V)
-        
-        if q_len != p_len:
-            # Truncate to the shorter length to avoid dimension mismatch
-            min_len = min(q_len, p_len)
-            q = q[:, :min_len, :]  # (1, min_len, V)
-            p_lm = p_lm[:min_len, :]  # (min_len, V)
-        
-        p = p_lm.clamp_min(eps).unsqueeze(0)  # (1, L, V)
-        mix = q * (p ** gamma)
-        mix = mix.clamp_min(eps)
-        return mix / mix.sum(dim=-1, keepdim=True)
-
 
 # ================================ Single Run Executor ================================ #
 
@@ -371,7 +314,6 @@ class SingleRunExecutor:
         self.tokenizer = tokenizer
         self.momentum_template = momentum_question_template
         self.utils = Utils()
-        self.poe = ProductOfExperts()
         
     def setup_run(self, run_dir: Path) -> Tuple[List[Variable], List[LeetCodeMomentumLoss], List[PythonSyntaxMomentumLoss], WandbLogger]:
         """Set up variables, losses, and logging for the run."""
@@ -402,18 +344,30 @@ class SingleRunExecutor:
             )
             if hasattr(var, "train"):
                 var.train()
+            
+            # Configure PoE for online guidance
+            if self.config.poe_gamma > 0.0:
+                var.configure_poe(
+                    lm=self.model.model,  # underlying HF model inside STGSDiffModel
+                    tokenizer=self.tokenizer,
+                    gamma=self.config.poe_gamma,
+                    prefix=item["poe_prefix"],  # already includes ```python\n
+                )
+            
             variables.append(var)
             
             # Create LeetCode momentum loss
             loss_fn = LeetCodeMomentumLoss(
                 critic_dlm=self.model,
-                problem_description=item["desc"]
+                problem_description=item["desc"],
+                use_cot=self.config.use_cot
             )
             momentum_losses.append(loss_fn)
             
             # Create syntax validation loss
             syntax_loss_fn = PythonSyntaxMomentumLoss(
-                critic_dlm=self.model
+                critic_dlm=self.model,
+                use_cot=self.config.use_cot
             )
             syntax_losses.append(syntax_loss_fn)
         
@@ -439,7 +393,7 @@ class SingleRunExecutor:
     
     def training_step(self, step: int, variables: List[Variable], momentum_losses: List[LeetCodeMomentumLoss],
                      syntax_losses: List[PythonSyntaxMomentumLoss], q_init_list: List[torch.Tensor], 
-                     q_prev_list: List[torch.Tensor], optimizer: torch.optim.Optimizer, start_time: float) -> Dict[str, Any]:
+                     q_prev_list: List[torch.Tensor], optimizer: torch.optim.Optimizer, scheduler, start_time: float) -> Dict[str, Any]:
         """Execute a single training step."""
         step_start_time = time.time()
         optimizer.zero_grad()
@@ -463,8 +417,8 @@ class SingleRunExecutor:
             # Get training distribution
             _, q_train, _ = var()
             
-            # Apply PoE if enabled
-            q_eff = self._apply_poe_if_enabled(var, item, q_train, step)
+            # Use the distribution directly (PoE is applied online in Variable.forward)
+            q_eff = q_train
             
             # Compute momentum loss
             m_loss = loss_fn(batched_one_hot=[q_eff])
@@ -489,6 +443,7 @@ class SingleRunExecutor:
         total_loss.backward()
         
         optimizer.step()
+        scheduler.step()
         
         # Sample for logging
         _, _, text_sample = variables[0].forward(temperature=max(0.1, min(1.0, T_now)))
@@ -506,6 +461,7 @@ class SingleRunExecutor:
             "kl/Ct_minus_1_to_Ct": float(kl_ctm1_ct_sum.item() / max(1, n_items)),
             "poe/lm_entropy": ent_lm_sum / max(1, n_items) if self.config.poe_gamma > 0 else float("nan"),
             "optimization/temperature": float(T_now),
+            "optimization/learning_rate": float(scheduler.get_last_lr()[0]) if scheduler else float("nan"),
             "samples/generated_code": text_sample,
             "timing/step_duration_sec": step_end_time - step_start_time,
             "timing/elapsed_time_sec": step_end_time - start_time,
@@ -559,22 +515,6 @@ class SingleRunExecutor:
                     setattr(var.stgs, "temperature", temperature)
                 except Exception:
                     pass
-    
-    def _apply_poe_if_enabled(self, var: Variable, item: Dict, q_train: torch.Tensor, step: int) -> torch.Tensor:
-        """Apply Product-of-Experts if enabled."""
-        if self.config.poe_gamma <= 0 or step % max(1, self.config.poe_every) != 0:
-            return q_train
-        
-        try:
-            code_argmax = var.forward_sample(temperature=0.0)
-        except Exception:
-            code_argmax = ""
-        
-        p_lm = self.poe.compute_lm_distributions(
-            self.model, self.tokenizer, item["poe_prefix"], code_argmax, self.config.device
-        )
-        
-        return self.poe.apply_poe(q_train, p_lm, self.config.poe_gamma)
     
     def _monitor_kl_divergences(self, var: Variable, q_init: torch.Tensor, 
                                q_prev_list: List[torch.Tensor], idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -702,7 +642,10 @@ class ExperimentRunner:
             desc = prob.get("problem_description", "")
             starter = clean_for_submission(prob.get("starter_code", "") or "def solution():\n    pass")
             
-            poe_prefix = f"Problem:\n{desc}\n\nCode:```python\n"
+            # Build PoE prefix with chat template support for instruct models
+            system_text = "You are a helpful coding assistant. Reply with Python code only."
+            user_text = f"Problem:\n{desc}\n\nCode:\n```python\n"
+            poe_prefix = build_chat_prefix(tokenizer, system_text, user_text)
             
             starter_ids = tokenizer(starter, add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)[0]
             if starter_ids.size(0) > self.config.max_len_tokens:
@@ -734,12 +677,14 @@ class ExperimentRunner:
             t_final=self.config.t_final,
             n_steps=self.config.n_steps,
             lr=self.config.lr,
+            lr_scheduler=self.config.lr_scheduler,
+            lr_scheduler_kwargs=self.config.lr_scheduler_kwargs,
             hard_mode=self.config.hard_mode,
             leetcode_loss_weight=self.config.leetcode_loss_weight,
             syntax_loss_weight=self.config.syntax_loss_weight,
+            use_cot=self.config.use_cot,
             monitor_temperature=self.config.monitor_temperature,
             poe_gamma=self.config.poe_gamma,
-            poe_every=self.config.poe_every,
             kl_clip=self.config.kl_clip,
             device=self.device,
             wandb_project=self.config.wandb_project if not self.config.disable_wandb else None,
@@ -747,6 +692,44 @@ class ExperimentRunner:
             wandb_tags=self.config.wandb_tags,
             wandb_notes=self.config.wandb_notes,
         )
+    
+    def _create_lr_scheduler(self, optimizer: torch.optim.Optimizer, config: RunConfig):
+        """Create learning rate scheduler based on configuration."""
+        if config.lr_scheduler == "cosine":
+            # Use half period for cosine annealing to avoid learning rate going to 0
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, 
+                T_max=config.n_steps,
+                eta_min=config.lr * 0.1,  # Minimum learning rate is 10% of initial
+                **config.lr_scheduler_kwargs
+            )
+        elif config.lr_scheduler == "linear":
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=0.1,
+                total_iters=config.n_steps,
+                **config.lr_scheduler_kwargs
+            )
+        elif config.lr_scheduler == "exponential":
+            # Calculate gamma to decay to 10% by the end
+            gamma = (0.1) ** (1.0 / config.n_steps)
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer,
+                gamma=gamma,
+                **config.lr_scheduler_kwargs
+            )
+        elif config.lr_scheduler == "constant":
+            # No scheduling, constant learning rate
+            scheduler = torch.optim.lr_scheduler.ConstantLR(
+                optimizer,
+                factor=1.0,
+                **config.lr_scheduler_kwargs
+            )
+        else:
+            raise ValueError(f"Unknown lr_scheduler: {config.lr_scheduler}")
+        
+        return scheduler
     
     def _execute_single_run(self, config: RunConfig, root_dir: Path, model, tokenizer, 
                            items: List[Dict], momentum_template: str) -> Dict:
@@ -772,13 +755,16 @@ class ExperimentRunner:
             all_params.extend(list(var.parameters()))
         optimizer = torch.optim.Adam(all_params, lr=config.lr)
         
+        # Set up learning rate scheduler
+        scheduler = self._create_lr_scheduler(optimizer, config)
+        
         # Training loop
         rows = []
         desc = f"run[{config.init_strategy}|T={config.temperature}|{config.schedule}] seed={config.seed}"
         print(f"Starting training loop with {config.n_steps} steps...")
         for step in tqdm(range(config.n_steps), desc=desc):
             metrics = executor.training_step(
-                step, variables, momentum_losses, syntax_losses, q_init_list, q_prev_list, optimizer, start_time
+                step, variables, momentum_losses, syntax_losses, q_init_list, q_prev_list, optimizer, scheduler, start_time
             )
             
             # Log to wandb
@@ -872,9 +858,11 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--t_final", type=float, default=0.1, help="Final temperature for schedules")
     parser.add_argument("--n_steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--lr", type=float, default=5e-2, help="Learning rate")
+    parser.add_argument("--lr_scheduler", type=str, default="cosine", choices=["cosine", "linear", "exponential", "constant"], help="Learning rate scheduler")
     parser.add_argument("--hard_mode", action="store_true", help="Enable hard mode for Variable initialization")
     parser.add_argument("--leetcode_loss_weight", type=float, default=1.0, help="Weight for LeetCode momentum loss")
     parser.add_argument("--syntax_loss_weight", type=float, default=1.0, help="Weight for Python syntax loss")
+    parser.add_argument("--use_cot", action="store_true", help="Enable chain-of-thought reasoning in momentum losses")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
     
     # Monitoring arguments
@@ -882,7 +870,6 @@ def create_parser() -> argparse.ArgumentParser:
     
     # Product-of-Experts arguments
     parser.add_argument("--poe_gamma", type=float, default=0.0, help="PoE mixing coefficient (0 disables)")
-    parser.add_argument("--poe_every", type=int, default=1, help="Recompute PoE distributions every N steps")
     
     # PPO-like clipping
     parser.add_argument("--kl_clip", type=float, default=None, help="KL clipping threshold")
@@ -920,13 +907,15 @@ def main():
         t_final=args.t_final,
         n_steps=args.n_steps,
         lr=args.lr,
+        lr_scheduler=args.lr_scheduler,
+        lr_scheduler_kwargs={},
         hard_mode=args.hard_mode,
         leetcode_loss_weight=args.leetcode_loss_weight,
         syntax_loss_weight=args.syntax_loss_weight,
+        use_cot=args.use_cot,
         seeds=args.seeds,
         monitor_temperature=args.monitor_temperature,
         poe_gamma=args.poe_gamma,
-        poe_every=args.poe_every,
         kl_clip=args.kl_clip,
         results_dir=args.results_dir,
         wandb_project=args.wandb_project,

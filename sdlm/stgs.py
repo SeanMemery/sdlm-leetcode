@@ -56,7 +56,10 @@ class STGS(nn.Module):
         x: Tensor, 
         temperature: Optional[float] = None,
         hidden_states: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+        expert_logprobs: Optional[Tensor] = None,
+        expert_gamma: float = 0.0,
+        eps: float = 1e-12,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Forward pass with STGS sampling.
         
@@ -64,9 +67,12 @@ class STGS(nn.Module):
             x: Input logits (batch_size, seq_len, vocab_size)
             temperature: Optional temperature to use for Gumbel-Softmax sampling
             hidden_states: Optional hidden states for conditional temperature
+            expert_logprobs: Optional expert log-probabilities for PoE (batch_size, seq_len, vocab_size)
+            expert_gamma: Gamma weight for expert prior in PoE
+            eps: Small epsilon for numerical stability
             
         Returns:
-            Tuple of (sampled_tokens, sampled_probs, temperature)
+            Tuple of (sampled_tokens, sampled_probs, temperature, y_soft)
         """
         if temperature is not None:
             eff_temperature = torch.tensor([temperature], device=self.device)
@@ -87,6 +93,13 @@ class STGS(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
+
+        # Inject expert prior in logit space: add gamma*log p_lm
+        # Note: add before dividing by temperature to match PoE on probabilities.
+        if expert_logprobs is not None and expert_gamma > 0:
+            # Safety on dtype/shape
+            expert_logprobs = expert_logprobs.to(device=x.device, dtype=x.dtype)
+            x = x + expert_gamma * expert_logprobs
 
         # Gumbel-Softmax sampling
         with torch.no_grad():

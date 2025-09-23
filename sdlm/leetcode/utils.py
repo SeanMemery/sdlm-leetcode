@@ -1,7 +1,7 @@
 import re
 import torch
-from typing import Tuple
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from typing import Tuple, Optional
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, StoppingCriteria, StoppingCriteriaList
 from ..stgs_diff_model import STGSDiffModel
 
 def extract_python_block(text: str) -> str:
@@ -141,3 +141,120 @@ def generate_initial_code(coder_model: STGSDiffModel, tokenizer, problem_prompt:
     else:
         # If no generation, return starter code as-is
         return starter_code
+
+
+
+class CodeBlockStopping(StoppingCriteria):
+    """
+    Stop generation once a complete fenced code block ``` ... ``` has been produced
+    after the prompt prefix. Works by decoding only the newly generated tail.
+    """
+    def __init__(self, tokenizer, start_len: int):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.start_len = start_len
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        # Decode only the new tokens (beyond the prompt)
+        gen_ids = input_ids[0, self.start_len:]
+        # Be gentle with decoding length to keep this cheap
+        text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+        # Stop when we see a complete fenced block
+        return text.count("```") >= 2
+
+
+def rewrite_to_valid_python_cot(
+    base_model,
+    tokenizer,
+    code: str,
+    max_new_tokens: int = 256,
+    temperature: float = 0.3,
+    top_p: float = 0.9,
+    top_k: int = 50,
+    repetition_penalty: float = 1.05,
+    system_prompt: Optional[str] = None,
+) -> str:
+    """
+    Rewrite code as syntactically valid Python 3 using a short, internal chain-of-thought.
+    The model is instructed to think step-by-step internally but output ONLY a single
+    Python code block (no explanations).
+
+    Returns a cleaned Python string (best-effort) extracted from the model output.
+    """
+    device = next(base_model.parameters()).device
+
+    # Build a chat-style prompt when available; otherwise fall back to a plain prompt.
+    # We explicitly instruct "internal" reasoning and to output code only.
+    default_system = (
+        "You are an expert Python assistant. You will silently think through the "
+        "steps necessary to fix code syntax, but you will not reveal your reasoning. "
+        "You will output only the final corrected Python code in a single fenced block."
+    )
+    user_instruction = (
+        "Rewrite the following into syntactically valid Python 3. "
+        "Fix any missing imports, indentation, colons, parentheses, quotes, and incomplete blocks. "
+        "DO NOT include explanations, comments, or reasoning in your reply. "
+        "Output ONLY a single fenced code block:\n\n"
+        "```python\n"
+        f"{code}\n"
+        "```"
+    )
+
+    supports_chat = hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None)
+    if supports_chat:
+        messages = [
+            {"role": "system", "content": system_prompt or default_system},
+            {"role": "user", "content": user_instruction},
+        ]
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    else:
+        # Plain prompt fallback with the same "internal CoT, output-only" instruction.
+        prompt_text = (
+            (system_prompt or default_system) + "\n\n"
+            + user_instruction + "\n\n"
+            "Final answer (code only):\n```python\n"
+        )
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+
+    # Ensure pad token is set
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Stop when a fenced code block is completed
+    start_len = inputs["input_ids"].shape[1]
+    stopping_criteria = StoppingCriteriaList([CodeBlockStopping(tokenizer, start_len=start_len)])
+
+    with torch.no_grad():
+        gen = base_model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            stopping_criteria=stopping_criteria,
+        )
+
+    text = tokenizer.decode(gen[0], skip_special_tokens=True)
+    rewritten = extract_python_block(text)
+    return clean_for_submission(rewritten) if rewritten else clean_for_submission(text)
+
+
+def build_chat_prefix(tokenizer, system_text: str, user_text: str) -> str:
+    """Build chat-formatted prefix for instruct models with fallback."""
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ]
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        # Fallback to plain prefix
+        return f"{system_text}\n\n{user_text}"

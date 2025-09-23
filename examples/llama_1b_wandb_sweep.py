@@ -64,6 +64,11 @@ sweep_config = {
             "distribution": "uniform",
             "min": 0.0,
             "max": 1.0
+        },
+        
+        # Chain-of-thought mode
+        "use_cot": {
+            "values": [False, True]
         }
     }
 }
@@ -97,16 +102,18 @@ def train():
             init_strategies=[config.init_strategy],
             temperatures=[temperature],
             schedules=["cosine"],
-            t_final=0.1,
-            n_steps=2000,
+            t_final=0.3,
+            n_steps=5000,
             lr=5e-3,
+            lr_scheduler="cosine",
+            lr_scheduler_kwargs={},
             hard_mode=config.hard_mode,
             leetcode_loss_weight=leetcode_weight,
             syntax_loss_weight=syntax_weight,
             seeds=[325],
-            monitor_temperature=0.1,
+            monitor_temperature=0.3,
             poe_gamma=config.poe_gamma,
-            poe_every=1,
+            use_cot=config.use_cot,
             results_dir=f"./results/llama1b_sweep/run_{run.id}",
             disable_wandb=True  # Disable wandb in the experiment
         )

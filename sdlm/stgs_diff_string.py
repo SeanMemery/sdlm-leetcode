@@ -123,6 +123,14 @@ class STGSDiffString(nn.Module):
         )
 
         self.eff_temperature = 0.0
+        
+        # PoE config (optional)
+        self.poe_gamma = 0.0
+        self.poe_enabled = False
+        self.poe_prefix = None
+        self.poe_lm = None
+        self.poe_tok = None
+        self._poe_last_ids = None  # cached hard sample from previous forward
     
     def reset(
         self,
@@ -170,12 +178,30 @@ class STGSDiffString(nn.Module):
                 - one_hot: Differentiable one-hot encoding of the input_ids
                 - decoded_string: The decoded string from the current distribution
         """
+        # Compute expert log-probs if enabled
+        expert_logprobs = None
+        if self.poe_enabled and self.poe_gamma > 0.0:
+            if self._poe_last_ids is not None:
+                aligned_ids = self._poe_last_ids
+            else:
+                aligned_ids = self.input_ids  # teacher-forcing on initial string first time
+            expert_logprobs = self._compute_poe_logprobs(aligned_ids)  # (1, L, V)
+            # Cast to same dtype/location as logits
+            expert_logprobs = expert_logprobs.to(self.logits.device, dtype=self.logits.dtype)
+        
         # Apply STGS to get differentiable samples
-        diff_input_ids, diff_one_hot, eff_temperature, _ = self.stgs(
+        diff_input_ids, diff_one_hot, eff_temperature, y_soft = self.stgs(
             self.logits,
             temperature=temperature,
+            expert_logprobs=expert_logprobs,
+            expert_gamma=self.poe_gamma,
         )
         self.eff_temperature = (eff_temperature.sum()/len(eff_temperature)).item()
+
+        # Cache a hard sample to refresh expert alignment next time
+        with torch.no_grad():
+            hard_ids = diff_input_ids.long().detach().clone()  # (1, L)
+            self._poe_last_ids = hard_ids
 
         # Decode the string
         decoded_string = self.tokenizer.decode(diff_input_ids.long()[0].tolist())
@@ -209,6 +235,41 @@ class STGSDiffString(nn.Module):
         """Get the current differentiable one-hot encoding."""
         _, diff_one_hot, _ = self.forward(temperature=1.0)
         return diff_one_hot
+    
+    def configure_poe(self, lm, tokenizer, gamma: float, prefix: str):
+        """Configure Product-of-Experts for online guidance."""
+        self.poe_lm = lm
+        self.poe_tok = tokenizer
+        self.poe_gamma = float(gamma)
+        self.poe_enabled = gamma > 0.0 and lm is not None and tokenizer is not None
+        self.poe_prefix = prefix
+    
+    def _compute_poe_logprobs(self, aligned_ids: torch.Tensor) -> torch.Tensor:
+        """
+        aligned_ids: (1, L) token ids that define the code span for alignment.
+        Returns: (1, L, V) log-probs from the expert LM aligned to each code token position.
+        """
+        tok = self.poe_tok
+        lm = self.poe_lm
+        device = next(lm.parameters()).device
+
+        # Tokenize prefix and code
+        code_ids = aligned_ids.to(device)  # (1, L)
+        prefix_ids = tok(self.poe_prefix, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        full = torch.cat([prefix_ids, code_ids], dim=1)  # (1, T)
+
+        with torch.no_grad():
+            out = lm(input_ids=full, attention_mask=torch.ones_like(full), return_dict=True)
+            logits = out.logits  # (1, T, V)
+        # logits[t] predicts token at t+1. We want positions that predict the code tokens.
+        prefix_len = prefix_ids.size(1)
+        code_len = code_ids.size(1)
+        # Positions predicting each code token: [prefix_len-1 ... prefix_len+code_len-2]
+        code_predict_logits = logits[:, prefix_len-1: prefix_len+code_len-1, :]  # (1, L, V)
+
+        logprobs = F.log_softmax(code_predict_logits, dim=-1)  # (1, L, V)
+        # Match dtype/device of internal tensors later
+        return logprobs
     
     def __str__(self) -> str:
         return self.get_string()

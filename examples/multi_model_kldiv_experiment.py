@@ -152,6 +152,7 @@ def build_command(variant: ExperimentVariant, base_config: Dict[str, Any]) -> Li
         "--t_final", str(base_config["t_final"]),
         "--n_steps", str(model_config.n_steps),
         "--lr", str(model_config.lr),
+        "--lr_scheduler", "cosine",
         "--seeds"] + [str(s) for s in base_config["seeds"]] + [
         
         # Monitoring settings
@@ -159,7 +160,7 @@ def build_command(variant: ExperimentVariant, base_config: Dict[str, Any]) -> Li
         
         # Product-of-Experts settings
         "--poe_gamma", str(variant.poe_gamma),
-        "--poe_every", str(base_config["poe_every"]),
+        "--use_cot", "False",  # Disable CoT for multi-model experiments
 
         # Output settings
         "--results_dir", f"./results/{variant.results_suffix}",
@@ -249,7 +250,6 @@ def main():
         "t_final": 0.1,
         "seeds": [42],
         "monitor_temperature": 0.1,
-        "poe_every": 25,
         "split": "train",
         "difficulty": "Easy",
         "inits": ["fluency", "random"],

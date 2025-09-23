@@ -17,15 +17,17 @@ from kldiv_exp_full import ExperimentConfig, ExperimentRunner
 
 CONFIG = {
     # Core experiment parameters
-    "init_strategy": "random",  # "fluency" or "random"
-    "temperature": 3.0,
+    "init_strategy": "fluency",  # "fluency" or "random"
+    "temperature": 1.0,
     "hard_mode": True,
-    "poe_gamma": 0.0,  # 0.0 = disabled
+    "poe_gamma": 1.0,  # 0.0 = disabled
     "leetcode_to_syntax": 0.75,  # 0.0=all syntax, 1.0=all leetcode
+    "use_cot": True,  # Enable chain-of-thought in momentum losses
     
     # Training parameters
     "n_steps": 5000,
     "lr": 1e-3,
+    "lr_scheduler": "cosine",  # cosine, linear, exponential, constant
     "seed": 42,
     
     # Output settings
@@ -34,7 +36,7 @@ CONFIG = {
     "disable_wandb": False,
     
     # Callback settings
-    "print_every": 10,  # Print test string every N steps
+    "print_every": 50,  # Print test string every N steps
 }
 
 def create_print_callback(print_every=10):
@@ -43,8 +45,8 @@ def create_print_callback(print_every=10):
         if step % print_every == 0:
             print(f"\n--- Step {step} ---")
             for i, var in enumerate(variables):
-                current_text = var.decode()
-                print(f"Variable {i}: {current_text}")
+                _, _, current_text = var.forward(temperature=0.3)
+                print(f"Variable {i}: [{current_text}]")
             
             # Print relevant metrics
             leetcode_loss = metrics.get("loss/leetcode_momentum", "N/A")
@@ -73,12 +75,17 @@ def main():
                        help="Product-of-Experts gamma value (0.0 = disabled)")
     parser.add_argument("--leetcode_to_syntax", type=float, default=CONFIG["leetcode_to_syntax"],
                        help="Loss weight ratio: 0.0=all syntax, 1.0=all leetcode")
+    parser.add_argument("--use_cot", action="store_true", default=CONFIG["use_cot"],
+                       help="Enable chain-of-thought in momentum losses")
     
     # Training parameters (defaults from CONFIG)
     parser.add_argument("--n_steps", type=int, default=CONFIG["n_steps"],
                        help="Number of training steps")
     parser.add_argument("--lr", type=float, default=CONFIG["lr"],
                        help="Learning rate")
+    parser.add_argument("--lr_scheduler", type=str, default=CONFIG["lr_scheduler"],
+                       choices=["cosine", "linear", "exponential", "constant"],
+                       help="Learning rate scheduler")
     parser.add_argument("--seed", type=int, default=CONFIG["seed"],
                        help="Random seed")
     
@@ -104,6 +111,7 @@ def main():
     print(f"PoE gamma: {args.poe_gamma}")
     print(f"LeetCode weight: {leetcode_weight:.2f}")
     print(f"Syntax weight: {syntax_weight:.2f}")
+    print(f"Use CoT: {args.use_cot}")
     print(f"Steps: {args.n_steps}")
     print(f"Learning rate: {args.lr}")
     print(f"Seed: {args.seed}")
@@ -122,13 +130,15 @@ def main():
         t_final=0.1,
         n_steps=args.n_steps,
         lr=args.lr,
+        lr_scheduler=args.lr_scheduler,
+        lr_scheduler_kwargs={},
         hard_mode=args.hard_mode,
         leetcode_loss_weight=leetcode_weight,
         syntax_loss_weight=syntax_weight,
         seeds=[args.seed],
         monitor_temperature=0.1,
         poe_gamma=args.poe_gamma,
-        poe_every=1,
+        use_cot=args.use_cot,
         results_dir=args.results_dir,
         wandb_project=args.wandb_project,
         disable_wandb=args.disable_wandb

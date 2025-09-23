@@ -26,6 +26,10 @@ class MomentumLossFunction:
         self.momentum_answer = momentum_answer
         self.use_cot = use_cot
         self.answer_extractor = answer_extractor
+        
+        # Set default extractor for CoT if not provided
+        if self.use_cot and not self.answer_extractor:
+            self.answer_extractor = "Therefore, after deliberation, to answer your direct question ($YES or $NO answer) : $"
 
         self._pre_ids: Optional[torch.Tensor] = None
         self._post_ids: Optional[torch.Tensor] = None
@@ -166,96 +170,60 @@ class MomentumLossFunction:
         return self._loss_from_next_token_logits(next_logits, target_id)
     
     def _forward_cot_differentiable(self, code_emb: torch.Tensor, W: torch.Tensor, target_id: int) -> torch.Tensor:
-        """Chain of thought evaluation: first generate reasoning, then get answer."""
+        """
+        CoT-style evaluation without sampling: we append a fixed 'think step by step' scaffold
+        and an answer extractor, then read the next-token logits. Fully differentiable w.r.t. code_emb.
+        """
         device = self.device
         model = self.critic_dlm
         vocab_size = W.shape[0]
-        
+
+        # Compose parts
         pre, post = self._format_question_parts()
-        reasoning_prompt = post + "\n\nLet me think step by step.\n"
-        
-        # Step 1: Generate reasoning
-        reasoning_pre_ids = self.tokenizer(pre, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        reasoning_post_ids = self.tokenizer(reasoning_prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        
-        reasoning_pre_oh = self._one_hot_from_ids(reasoning_pre_ids, vocab_size, dtype=W.dtype, device=device)
-        reasoning_post_oh = self._one_hot_from_ids(reasoning_post_ids, vocab_size, dtype=W.dtype, device=device)
-        reasoning_pre_emb = self._oh_to_emb(reasoning_pre_oh, W)
-        reasoning_post_emb = self._oh_to_emb(reasoning_post_oh, W)
-        
-        reasoning_inputs = torch.cat([reasoning_pre_emb, code_emb, reasoning_post_emb], dim=1)
-        reasoning_attn = torch.ones(reasoning_inputs.shape[:-1], dtype=torch.long, device=device)
-        
-        # Generate reasoning (limit to ~250 tokens to keep it manageable)
-        with torch.no_grad():
-            # The issue is in the STGS model's generate method, bypass it completely
-            if hasattr(model, 'model'):
-                # This is an STGSDiffModel wrapper, use the underlying transformers model
-                base_model = model.model
-            else:
-                base_model = model
-            
-            reasoning_output = base_model.generate(
-                inputs_embeds=reasoning_inputs,
-                attention_mask=reasoning_attn,
-                max_new_tokens=50,  # Reduce from 250 to prevent freezing
-                max_length=reasoning_inputs.shape[1] + 50,  # Explicit max length
-                temperature=0.3,
-                do_sample=True,
-                top_p=0.9,
-                top_k=50,
-                repetition_penalty=1.1,  # Prevent repetition loops
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                early_stopping=True,  # Stop at EOS token
-            )
-        
-        # Step 2: Get final answer
-        reasoning_text = self.tokenizer.decode(reasoning_output[0], skip_special_tokens=True)
-        answer_prompt = reasoning_text + f"\n\nBased on the above reasoning, the answer is "
-        
-        answer_inputs = self.tokenizer(answer_prompt, return_tensors="pt").to(device)
-        
-        # Handle STGSDiffModel vs base model differences
-        try:
-            answer_outputs = model(
-                input_ids=answer_inputs["input_ids"],
-                attention_mask=answer_inputs.get("attention_mask"),
-                return_dict=True,
-                output_normal_logits=True
-            )
-        except Exception as e:
-            # Try with the base model if STGSDiffModel fails
-            if hasattr(model, 'model'):
-                answer_outputs = model.model(
-                    input_ids=answer_inputs["input_ids"],
-                    attention_mask=answer_inputs.get("attention_mask"),
-                    return_dict=True
-                )
-            else:
-                raise e
-        
-        # Check if outputs has logits attribute
-        if answer_outputs is None:
-            raise ValueError("Model returned None output")
-        if not hasattr(answer_outputs, 'logits') or answer_outputs.logits is None:
-            # Try to get logits from different attribute names
-            if hasattr(answer_outputs, 'last_hidden_state'):
-                # If we only have hidden states, we need to project to vocab
-                hidden_states = answer_outputs.last_hidden_state
-                if hasattr(model, 'lm_head'):
-                    logits = model.lm_head(hidden_states)
-                elif hasattr(model, 'model') and hasattr(model.model, 'lm_head'):
-                    logits = model.model.lm_head(hidden_states)
-                else:
-                    raise ValueError("Cannot find lm_head to compute logits from hidden states")
-                next_logits = logits[:, -1, :]  # (1, V)
-            else:
-                raise ValueError(f"Model output has no logits attribute. Available attributes: {dir(answer_outputs)}")
+        # Reasoning scaffold right after the code
+        reasoning_scaffold = post + "\n\nLet me think step by step.\n"
+        # Answer prompt (extractor preferred)
+        if self.answer_extractor:
+            answer_hint = "\n\n" + self.answer_extractor
         else:
-            next_logits = answer_outputs.logits[:, -1, :]  # (1, V)
-            
+            answer_hint = "\n\nAnswer: "
+
+        # Tokenize fixed text pieces
+        tok = self.tokenizer
+        pre_ids = tok(pre, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        reason_ids = tok(reasoning_scaffold, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        answer_ids = tok(answer_hint, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+
+        # Convert to one-hot then to embeddings
+        pre_oh = self._one_hot_from_ids(pre_ids, vocab_size, dtype=W.dtype, device=device)
+        reason_oh = self._one_hot_from_ids(reason_ids, vocab_size, dtype=W.dtype, device=device)
+        answer_oh = self._one_hot_from_ids(answer_ids, vocab_size, dtype=W.dtype, device=device)
+
+        pre_emb = self._oh_to_emb(pre_oh, W)
+        reason_emb = self._oh_to_emb(reason_oh, W)
+        answer_emb = self._oh_to_emb(answer_oh, W)
+
+        # Full context: [pre][code (differentiable)][reason_scaffold][answer_hint]
+        inputs_embeds = torch.cat([pre_emb, code_emb, reason_emb, answer_emb], dim=1)
+        if inputs_embeds.size(1) == 0:
+            # Graceful degenerate case
+            return torch.zeros((), device=device, dtype=W.dtype).sum()
+
+        attn = torch.ones(inputs_embeds.shape[:-1], dtype=torch.long, device=device)
+
+        outputs = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attn,
+            return_dict=True,
+            output_normal_logits=True
+        )
+
+        if outputs is None or not hasattr(outputs, 'logits') or outputs.logits is None:
+            raise ValueError("Model output missing logits for CoT differentiable path")
+
+        next_logits = outputs.logits[:, -1, :]  # (1, V) — after answer hint
         return self._loss_from_next_token_logits(next_logits, target_id)
+
     
     def _loss_from_next_token_logits(self, next_logits: torch.Tensor, target_id: int) -> torch.Tensor:
         # next_logits: (1, V)
@@ -368,21 +336,15 @@ class MomentumLossFunction:
         ).to(device)
         
         with torch.no_grad():
-            # The issue is in the STGS model's generate method, not the input tensors
-            # We need to bypass the STGS wrapper entirely and use the base transformers model
-            if hasattr(model, 'model'):
-                # This is an STGSDiffModel wrapper, use the underlying transformers model
-                base_model = model.model
-            else:
-                base_model = model
+
+            base_model = model.model
             
             reasoning_output = base_model.generate(
                 input_ids=reasoning_inputs["input_ids"],
                 attention_mask=reasoning_inputs.get("attention_mask"),
-                max_new_tokens=30,  # Reduce to prevent freezing
-                max_length=reasoning_inputs["input_ids"].shape[1] + 30,  # Explicit max length
-                temperature=0.5,
-                do_sample=True,
+                max_new_tokens=128,  
+                temperature=0.3,
+                do_sample=False,
                 top_p=0.9,
                 top_k=50,
                 repetition_penalty=1.1,  # Prevent repetition loops
@@ -393,7 +355,11 @@ class MomentumLossFunction:
         
         # Step 2: Get final answer
         reasoning_text = tok.decode(reasoning_output[0], skip_special_tokens=True)
-        answer_prompt = reasoning_text + f"\n\nBased on the above reasoning, the answer is "
+        if self.answer_extractor:
+            # e.g., "Therefore, after deliberation, to answer your direct question ($YES or $NO answer) : $"
+            answer_prompt = reasoning_text + "\n\n" + self.answer_extractor
+        else:
+            answer_prompt = reasoning_text + f"\n\nBased on the above reasoning, the answer is "
         
         answer_inputs = tok(answer_prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
         
@@ -462,7 +428,7 @@ class PythonSyntaxMomentumLoss:
     based on whether the generated code has valid Python syntax.
     """
     
-    def __init__(self, critic_dlm):
+    def __init__(self, critic_dlm, use_cot: bool = False):
         self.critic_dlm = critic_dlm
         
         # Create the momentum question for syntax validation
@@ -476,7 +442,7 @@ class PythonSyntaxMomentumLoss:
             momentum_question=self.momentum_question,
             Momentum_variables=self.momentum_variables,
             momentum_answer=self.momentum_answer,
-            use_cot=False
+            use_cot=use_cot
         )
     
     @property
@@ -519,7 +485,7 @@ class LeetCodeMomentumLoss:
     It's a cleaner, class-based version of the original MomentumLossFunction.
     """
     
-    def __init__(self, critic_dlm, problem_description: str):
+    def __init__(self, critic_dlm, problem_description: str, use_cot: bool = False):
         self.critic_dlm = critic_dlm
         self.problem_description = problem_description
         
@@ -534,7 +500,7 @@ class LeetCodeMomentumLoss:
             momentum_question=self.momentum_question,
             Momentum_variables=self.momentum_variables,
             momentum_answer=self.momentum_answer,
-            use_cot=False
+            use_cot=use_cot
         )
     
     @property
