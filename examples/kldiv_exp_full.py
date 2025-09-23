@@ -62,8 +62,12 @@ class ExperimentConfig:
     t_final: float = 0.7
     n_steps: int = 10000
     lr: float = 5e-2
-    clip_norm: float = 1.0
     seeds: List[int] = field(default_factory=lambda: [42])
+    hard_mode: bool = False
+    
+    # Loss weights
+    leetcode_loss_weight: float = 1.0
+    syntax_loss_weight: float = 1.0
     
     # Monitoring configuration
     monitor_temperature: float = 0.7
@@ -109,7 +113,9 @@ class RunConfig:
     t_final: float
     n_steps: int
     lr: float
-    clip_norm: float
+    hard_mode: bool
+    leetcode_loss_weight: float
+    syntax_loss_weight: float
     monitor_temperature: float
     poe_gamma: float
     poe_every: int
@@ -293,40 +299,40 @@ class ProductOfExperts:
     
     @staticmethod
     def compute_lm_distributions(model, tokenizer, prefix: str, code_text: str, device: str) -> torch.Tensor:
-        """Compute per-position next-token distributions using teacher forcing."""
+        """Compute per-position next-token distributions matching autoregressive generation."""
         with torch.no_grad():
+            # Tokenize components
             code_ids = tokenizer(code_text, add_special_tokens=False, return_tensors="pt").input_ids.to(device)[0]
-            L = code_ids.size(0)
-            pre_ids = tokenizer(prefix, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            prefix_ids = tokenizer(prefix, add_special_tokens=False, return_tensors="pt").input_ids.to(device)[0]
             
-            p_list = []
-            for t in range(L):
-                if t == 0:
-                    ctx_ids = pre_ids
-                else:
-                    ctx_ids = torch.cat([pre_ids, code_ids[:t].unsqueeze(0)], dim=1)
-                attn = torch.ones_like(ctx_ids)
-                # Handle STGSDiffModel vs base model differences
-                try:
-                    out = model(input_ids=ctx_ids, attention_mask=attn, return_dict=True, output_normal_logits=True)
-                except Exception as e:
-                    # Try with the base model if STGSDiffModel fails
-                    if hasattr(model, 'model'):
-                        out = model.model(input_ids=ctx_ids, attention_mask=attn, return_dict=True)
-                    else:
-                        raise e
-                
-                # Check if outputs has logits attribute
-                if out is None:
-                    raise ValueError("Model returned None output")
-                
-                if not hasattr(out, 'logits') or out.logits is None:
-                    raise ValueError(f"Model output missing logits. Output type: {type(out)}")
-                
-                logp = out.logits[:, -1, :].log_softmax(dim=-1).squeeze(0)
-                p_list.append(logp.exp())
+            # Concatenate prefix + code for full context
+            full_context = torch.cat([prefix_ids, code_ids], dim=0).unsqueeze(0)  # (1, seq_len)
+            attn_mask = torch.ones_like(full_context)
             
-            p_lm = torch.stack(p_list, dim=0)  # (L, V)
+            # Get logits for entire sequence in one forward pass
+            out = model(input_ids=full_context, attention_mask=attn_mask, return_dict=True, output_normal_logits=True)
+            
+            # Check if outputs has logits attribute
+            if out is None:
+                raise ValueError("Model returned None output")
+            
+            if not hasattr(out, 'logits') or out.logits is None:
+                raise ValueError(f"Model output missing logits. Output type: {type(out)}")
+            
+            # Extract autoregressive logits for the code portion
+            # out.logits shape: (1, seq_len, vocab_size)
+            # Position i in logits predicts token i+1 in the sequence
+            # So logits[prefix_len-1:prefix_len+code_len-1] predict the code tokens
+            prefix_len = prefix_ids.size(0)
+            code_len = code_ids.size(0)
+            
+            # Get logits that predict each code token autoregressively
+            code_logits = out.logits[0, prefix_len-1:prefix_len + code_len - 1, :]  # (code_len, vocab_size)
+            
+            # Convert to probabilities
+            p_lm = code_logits.softmax(dim=-1)  # (code_len, vocab_size)
+            
+            # Ensure correct device and dtype
             W = model.get_input_embeddings().weight
             return p_lm.to(device=W.device, dtype=W.dtype)
     
@@ -388,9 +394,9 @@ class SingleRunExecutor:
                 tokenizer=self.tokenizer,
                 initial_str=init_text,
                 template="{VARIABLE}",
-                use_fluency_constraint=self.config.init_strategy == "fluency",
+                init_strategy=self.config.init_strategy,
                 temperature=self.config.temperature,
-                hard=False,
+                hard=self.config.hard_mode,
                 learnable_temperature=False,
                 device=self.config.device,
             )
@@ -466,38 +472,26 @@ class SingleRunExecutor:
             # Compute syntax loss
             s_loss = syntax_fn(batched_one_hot=[q_eff])
             
-            # KL clipping
-            scale = self._compute_kl_clip_scale(q_prev_list[idx], var, idx)
-            
             # Monitor KL divergences
             kl_c0_ct, kl_ctm1_ct = self._monitor_kl_divergences(var, q_init_list[idx], q_prev_list, idx)
             
-            momentum_sum += (scale * m_loss)
-            syntax_sum += (scale * s_loss)
+            momentum_sum += m_loss
+            syntax_sum += s_loss
             kl_c0_ct_sum += kl_c0_ct
             kl_ctm1_ct_sum += kl_ctm1_ct
         
         # Backward pass with combined loss
         momentum_mean = momentum_sum / max(1, n_items)
         syntax_mean = syntax_sum / max(1, n_items)
-        total_loss = momentum_mean + syntax_mean
+        weighted_momentum = self.config.leetcode_loss_weight * momentum_mean
+        weighted_syntax = self.config.syntax_loss_weight * syntax_mean
+        total_loss = weighted_momentum + weighted_syntax
         total_loss.backward()
-        
-        if self.config.clip_norm and self.config.clip_norm > 0:
-            all_params = []
-            for var in variables:
-                all_params.extend(list(var.parameters()))
-            torch.nn.utils.clip_grad_norm_(all_params, self.config.clip_norm)
         
         optimizer.step()
         
         # Sample for logging
-        text_sample = ""
-        if variables and hasattr(variables[0], "forward_sample"):
-            try:
-                text_sample = variables[0].forward_sample(temperature=max(0.3, min(1.0, T_now)))
-            except Exception:
-                pass
+        _, _, text_sample = variables[0].forward(temperature=max(0.1, min(1.0, T_now)))
         
         step_end_time = time.time()
         
@@ -505,6 +499,8 @@ class SingleRunExecutor:
             "step": step,
             "loss/leetcode_momentum": float(momentum_mean.item()),
             "loss/python_syntax": float(syntax_mean.item()),
+            "loss/leetcode_momentum_weighted": float(weighted_momentum.item()),
+            "loss/python_syntax_weighted": float(weighted_syntax.item()),
             "loss/total_combined": float(total_loss.item()),
             "kl/C0_to_Ct": float(kl_c0_ct_sum.item() / max(1, n_items)),
             "kl/Ct_minus_1_to_Ct": float(kl_ctm1_ct_sum.item() / max(1, n_items)),
@@ -515,12 +511,12 @@ class SingleRunExecutor:
             "timing/elapsed_time_sec": step_end_time - start_time,
         }
     
-    def generate_final_samples(self, variables: List[Variable], samples_dir: Path) -> List[str]:
+    def generate_final_samples(self, variables: List[Variable], samples_dir: Path, temperature: float) -> List[str]:
         """Generate and save final samples."""
         final_samples = []
-        for i, var in enumerate(variables[:5]):
+        for i, var in enumerate(variables):
             try:
-                txt = var.forward_sample(temperature=0.3)
+                _, _, txt = var.forward(temperature=temperature)
                 final_samples.append(txt)
             except Exception:
                 txt = ""
@@ -575,24 +571,10 @@ class SingleRunExecutor:
             code_argmax = ""
         
         p_lm = self.poe.compute_lm_distributions(
-            self.model, self.tokenizer, item["prefix"], code_argmax, self.config.device
+            self.model, self.tokenizer, item["poe_prefix"], code_argmax, self.config.device
         )
         
         return self.poe.apply_poe(q_train, p_lm, self.config.poe_gamma)
-    
-    def _compute_kl_clip_scale(self, q_prev: torch.Tensor, var: Variable, idx: int) -> float:
-        """Compute KL clipping scale."""
-        if self.config.kl_clip is None or self.config.kl_clip <= 0:
-            return 1.0
-        
-        with torch.no_grad():
-            restored = self._set_monitoring_temp(var)
-            _, q_mon, _ = var()
-            self._restore_temp(var, restored)
-            
-            kl_ctm1_ct = self.utils.kl_divergence(q_prev, q_mon.detach())
-            denom = max(float(kl_ctm1_ct.item()), 1e-8)
-            return min(1.0, self.config.kl_clip / denom)
     
     def _monitor_kl_divergences(self, var: Variable, q_init: torch.Tensor, 
                                q_prev_list: List[torch.Tensor], idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -617,10 +599,11 @@ class SingleRunExecutor:
 class ExperimentRunner:
     """Main experiment runner that coordinates everything."""
     
-    def __init__(self, config: ExperimentConfig):
+    def __init__(self, config: ExperimentConfig, callback=None):
         self.config = config
         self.utils = Utils()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.callback = callback
     
     def get_temperatures_for_init(self, init_strategy: str) -> List[float]:
         """Get the appropriate temperatures for the given initialization strategy."""
@@ -708,6 +691,8 @@ class ExperimentRunner:
         self._save_experiment_summary(root_dir, summary_rows)
         print(f"\nAll experiments completed. Results saved to: {root_dir}")
         print("Check wandb for visualizations and analysis.")
+
+        return pd.DataFrame(summary_rows)
     
     def _prepare_dataset_items(self, dataset: List[Dict], tokenizer) -> List[Dict]:
         """Prepare dataset items for the experiment."""
@@ -717,7 +702,7 @@ class ExperimentRunner:
             desc = prob.get("problem_description", "")
             starter = clean_for_submission(prob.get("starter_code", "") or "def solution():\n    pass")
             
-            prefix = f"Problem:\n{desc}\n\nCode:\n"
+            poe_prefix = f"Problem:\n{desc}\n\nCode:```python\n"
             
             starter_ids = tokenizer(starter, add_special_tokens=False, return_tensors="pt").input_ids.to(self.device)[0]
             if starter_ids.size(0) > self.config.max_len_tokens:
@@ -728,7 +713,7 @@ class ExperimentRunner:
                 "slug": slug,
                 "desc": desc,
                 "starter_text": starter_text,
-                "prefix": prefix,
+                "poe_prefix": poe_prefix,
                 "length": starter_ids.size(0),
             })
         
@@ -749,7 +734,9 @@ class ExperimentRunner:
             t_final=self.config.t_final,
             n_steps=self.config.n_steps,
             lr=self.config.lr,
-            clip_norm=self.config.clip_norm,
+            hard_mode=self.config.hard_mode,
+            leetcode_loss_weight=self.config.leetcode_loss_weight,
+            syntax_loss_weight=self.config.syntax_loss_weight,
             monitor_temperature=self.config.monitor_temperature,
             poe_gamma=self.config.poe_gamma,
             poe_every=self.config.poe_every,
@@ -800,6 +787,10 @@ class ExperimentRunner:
             # Add to local rows
             rows.append(metrics)
             
+            # Call callback if provided
+            if self.callback:
+                self.callback(step, variables, metrics)
+            
             # Save periodically
             if (step + 1) % 50 == 0 or step == config.n_steps - 1:
                 trace_df = pd.DataFrame(rows)
@@ -813,7 +804,7 @@ class ExperimentRunner:
         
         # Generate final samples
         samples_dir = self.utils.ensure_dir(run_dir / "samples")
-        final_samples = executor.generate_final_samples(variables, samples_dir)
+        final_samples = executor.generate_final_samples(variables, samples_dir, temperature=config.monitor_temperature)
         
         # Save training statistics
         training_stats = {
@@ -844,9 +835,11 @@ class ExperimentRunner:
             "seed": config.seed,
             "total_duration_min": total_duration / 60,
             "steps_completed": len(rows),
-            "final_momentum_mean": final_metrics.get("momentum_loss_mean", float("nan")),
-            "final_kl_C0_Ct_mean": final_metrics.get("kl_C0_Ct_mean", float("nan")),
-            "final_kl_Ctm1_Ct_mean": final_metrics.get("kl_Ctm1_Ct_mean", float("nan")),
+            "final_metrics": final_metrics,
+            "momentum_loss_mean": final_metrics.get("loss/leetcode_momentum", float("nan")),
+            "syntax_loss_mean": final_metrics.get("loss/python_syntax", float("nan")),
+            "final_kl_C0_Ct_mean": final_metrics.get("kl/C0_Ct", float("nan")),
+            "final_kl_Ctm1_Ct_mean": final_metrics.get("kl/Ctm1_Ct", float("nan")),
             "avg_step_duration_sec": total_duration / config.n_steps if config.n_steps > 0 else 0,
         }
     
@@ -876,14 +869,16 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fluency_temperatures", type=float, nargs="+", default=None, help="Temperatures for fluency initialization (defaults to --temperatures)")
     parser.add_argument("--random_temperatures", type=float, nargs="+", default=None, help="Temperatures for random initialization (defaults to --temperatures)")
     parser.add_argument("--schedules", type=str, nargs="+", default=["constant", "linear", "cosine", "exp_decay"], choices=["constant", "linear", "cosine", "exp_decay"], help="Temperature schedules")
-    parser.add_argument("--t_final", type=float, default=0.7, help="Final temperature for schedules")
+    parser.add_argument("--t_final", type=float, default=0.1, help="Final temperature for schedules")
     parser.add_argument("--n_steps", type=int, default=10000, help="Number of training steps")
     parser.add_argument("--lr", type=float, default=5e-2, help="Learning rate")
-    parser.add_argument("--clip_norm", type=float, default=1.0, help="Gradient clipping norm")
+    parser.add_argument("--hard_mode", action="store_true", help="Enable hard mode for Variable initialization")
+    parser.add_argument("--leetcode_loss_weight", type=float, default=1.0, help="Weight for LeetCode momentum loss")
+    parser.add_argument("--syntax_loss_weight", type=float, default=1.0, help="Weight for Python syntax loss")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="Random seeds")
     
     # Monitoring arguments
-    parser.add_argument("--monitor_temperature", type=float, default=0.7, help="Fixed temperature for KL monitoring")
+    parser.add_argument("--monitor_temperature", type=float, default=0.1, help="Fixed temperature for KL monitoring")
     
     # Product-of-Experts arguments
     parser.add_argument("--poe_gamma", type=float, default=0.0, help="PoE mixing coefficient (0 disables)")
@@ -925,7 +920,9 @@ def main():
         t_final=args.t_final,
         n_steps=args.n_steps,
         lr=args.lr,
-        clip_norm=args.clip_norm,
+        hard_mode=args.hard_mode,
+        leetcode_loss_weight=args.leetcode_loss_weight,
+        syntax_loss_weight=args.syntax_loss_weight,
         seeds=args.seeds,
         monitor_temperature=args.monitor_temperature,
         poe_gamma=args.poe_gamma,

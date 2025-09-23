@@ -152,7 +152,6 @@ def build_command(variant: ExperimentVariant, base_config: Dict[str, Any]) -> Li
         "--t_final", str(base_config["t_final"]),
         "--n_steps", str(model_config.n_steps),
         "--lr", str(model_config.lr),
-        "--clip_norm", str(base_config["clip_norm"]),
         "--seeds"] + [str(s) for s in base_config["seeds"]] + [
         
         # Monitoring settings
@@ -197,9 +196,6 @@ def run_experiment_variant(variant: ExperimentVariant, base_config: Dict[str, An
         return True
     except subprocess.CalledProcessError as e:
         print(f"\n❌ {variant.variant_name} experiment failed with return code {e.returncode}")
-        return False
-    except KeyboardInterrupt:
-        print(f"\n⚠️  {variant.variant_name} experiment interrupted by user")
         return False
     except Exception as e:
         print(f"\n💥 {variant.variant_name} experiment failed with unexpected error: {e}")
@@ -251,7 +247,6 @@ def main():
     base_config = {
         "schedules": ["cosine"],
         "t_final": 0.1,
-        "clip_norm": 0.0,
         "seeds": [42],
         "monitor_temperature": 0.1,
         "poe_every": 25,
